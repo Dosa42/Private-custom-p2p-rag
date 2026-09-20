@@ -1,3 +1,4 @@
+import java.util.Properties
 import com.android.build.api.variant.BuildConfigField
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
@@ -75,7 +76,7 @@ secrets {
 // Quote the API key ourselves: Secrets Plugin 2.0.1 leaves empty values unquoted.
 androidComponents {
   onVariants { variant ->
-    val properties = java.util.Properties()
+    val properties = Properties()
     listOf(
       ".env.example",
       ".env",
