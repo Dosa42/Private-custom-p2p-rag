@@ -79,15 +79,20 @@ truncated streams produce errors; there are no generated substitute answers.
 
 Android requires the configured JDK/Gradle and Android SDK 36.1. The existing GitHub
 workflow builds the real APK and runs the JVM/Robolectric regression tests. For a
-local debug build, use JDK 21, set `ANDROID_HOME`, and create the existing debug
-signing key path if absent:
+local debug build, use JDK 21, set `ANDROID_HOME`, and restore the project's fixed
+debug signing key:
 
 ```sh
-keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -validity 10000
+base64 --decode debug.keystore.base64 > debug.keystore
 bash gradlew :app:testDebugUnitTest :app:assembleDebug
 ```
 
-Do not regenerate an existing debug key when you need APK update compatibility.
+The application ID is `com.dosa42.trinitycore`, so Trinity installs separately from
+apps using the template ID `com.example`. CI and local builds use the same versioned
+debug key, allowing subsequent Trinity debug APKs to update this installation.
+The checked-in key is for development builds; release signing uses the separately
+configured release keystore. CI verifies the APK's application ID and signer before
+publishing it.
 Python tests include real localhost OAuth discovery, PKCE, token exchange, official
 MCP-client requests and WebSocket relay. Android tests exercise real local sockets,
 Unicode HTTP framing, owner persistence, peer transfer/integrity and Responses SSE.

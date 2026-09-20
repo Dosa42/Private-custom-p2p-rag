@@ -105,20 +105,11 @@ jobs:
           fi
           echo "✓ .env configuration validated"
 
-          # Fix 3: Use the same debug keystore path as app/build.gradle.kts
+          # Restore the project's fixed debug identity at Gradle's signing path.
           DEBUG_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
-          if [ ! -f "$DEBUG_KEYSTORE" ] && [ -f "debug.keystore.base64" ]; then
-            echo "Decoding debug.keystore.base64..."
-            base64 -d debug.keystore.base64 > "$DEBUG_KEYSTORE"
-          fi
-          if [ ! -f "$DEBUG_KEYSTORE" ]; then
-            echo "Generating debug keystore for CI..."
-            keytool -genkeypair -v -keystore "$DEBUG_KEYSTORE" -alias androiddebugkey \
-              -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          base64 --decode debug.keystore.base64 > "$DEBUG_KEYSTORE"
           keytool -list -keystore "$DEBUG_KEYSTORE" -storepass android -alias androiddebugkey > /dev/null
-          echo "Debug keystore ready at the Gradle signing path"
+          echo "Fixed Trinity debug keystore restored"
 
           # Fix 4: Memory and CI performance tuning in gradle.properties
           cat << 'EOF' >> gradle.properties
@@ -204,6 +195,7 @@ jobs:
       # 6. Locate, Validate & Generate APK Summary
       - name: Validate & Report Generated Debug APK
         if: success()
+        shell: bash
         run: |
           echo "=== Locating Built APKs ==="
           APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" -type f | head -n 1)
@@ -214,6 +206,19 @@ jobs:
           fi
 
           if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+            APK_PACKAGE=$("$BUILD_TOOLS_DIR/aapt" dump badging "$APK_PATH" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+            if [ "$APK_PACKAGE" != "com.dosa42.trinitycore" ]; then
+              echo "::error::Unexpected APK application ID: $APK_PACKAGE"
+              exit 1
+            fi
+            "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK_PATH" | tee apk-signature.log
+            EXPECTED_CERT_SHA256=$(keytool -exportcert -keystore "$GITHUB_WORKSPACE/debug.keystore" -storepass android -alias androiddebugkey | sha256sum | cut -d ' ' -f 1)
+            APK_CERT_SHA256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' apk-signature.log)
+            if [ "$APK_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::APK signer does not match the fixed Trinity debug certificate"
+              exit 1
+            fi
             FILE_SIZE=$(du -h "$APK_PATH" | cut -f1)
             SHA256_SUM=$(sha256sum "$APK_PATH" | cut -d ' ' -f 1)
             
@@ -232,6 +237,8 @@ jobs:
           | Metric | Value |
           |---|---|
           | **Artifact Path** | \`$APK_PATH\` |
+          | **Application ID** | \`$APK_PACKAGE\` |
+          | **Signing certificate SHA-256** | \`$APK_CERT_SHA256\` |
           | **Size** | **$FILE_SIZE** |
           | **SHA-256 Checksum** | \`$SHA256_SUM\` |
           | **Java Version** | **OpenJDK 21 (Temurin)** |
@@ -264,6 +271,7 @@ jobs:
           name: build-failure-diagnostics
           path: |
             android-tests.log
+            apk-signature.log
             build_attempt1.log
             build_attempt2.log
             app/build/reports/
