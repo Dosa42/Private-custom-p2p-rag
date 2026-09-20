@@ -72,17 +72,32 @@ secrets {
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
 }
 
-// Secrets Plugin 2.0.1 emits an empty Java expression for an empty property.
+// Quote the API key ourselves: Secrets Plugin 2.0.1 leaves empty values unquoted.
 androidComponents {
   onVariants { variant ->
-    val fields = checkNotNull(variant.buildConfigFields)
-    val field = fields.get()["GEMINI_API_KEY"]
-    if (field?.type == "String" && field.value == "") {
-      fields.put(
-        "GEMINI_API_KEY",
-        BuildConfigField("String", "\"\"", field.comment)
-      )
+    val properties = java.util.Properties()
+    listOf(
+      ".env.example",
+      ".env",
+      variant.buildType + ".properties",
+      variant.flavorName + ".properties"
+    ).forEach { name ->
+      val propertiesFile = rootProject.file(name)
+      if (propertiesFile.isFile) {
+        propertiesFile.inputStream().use { properties.load(it) }
+      }
     }
+    val value = properties.getProperty("GEMINI_API_KEY", "").removeSurrounding("\"")
+    val literal = "\"" + value
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+      .replace("\n", "\\n")
+      .replace("\r", "\\r")
+      .replace("\t", "\\t") + "\""
+    checkNotNull(variant.buildConfigFields).put(
+      "GEMINI_API_KEY",
+      BuildConfigField("String", literal, null)
+    )
   }
 }
 
