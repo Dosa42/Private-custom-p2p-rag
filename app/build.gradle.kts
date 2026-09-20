@@ -75,9 +75,10 @@ secrets {
 // Secrets Plugin 2.0.1 emits an empty Java expression for an empty property.
 androidComponents {
   onVariants { variant ->
-    val field = variant.buildConfigFields.get()["GEMINI_API_KEY"]
+    val fields = checkNotNull(variant.buildConfigFields)
+    val field = fields.get()["GEMINI_API_KEY"]
     if (field?.type == "String" && field.value == "") {
-      variant.buildConfigFields.put(
+      fields.put(
         "GEMINI_API_KEY",
         BuildConfigField("String", "\"\"", field.comment)
       )
