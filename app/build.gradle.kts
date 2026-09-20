@@ -71,6 +71,7 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  ignoreList.add("GEMINI_API_KEY")
 }
 
 // Quote the API key ourselves: Secrets Plugin 2.0.1 leaves empty values unquoted.

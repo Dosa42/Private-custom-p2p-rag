@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
 
 enum class TrinityTab(val title: String, val subtitle: String) {
     PIPELINE_RAG("RAG Core", "Ingest & Vector Query"),
-    HYBRID_CLOUD("Cloud AI Bridge", "Gemini / GPT-4o / Claude"),
+    HYBRID_CLOUD("Cloud AI Bridge", "ChatGPT OAuth PKCE"),
     STORAGE_TIERS("Storage Tiers", "HOT/WARM/COLD/FROZEN"),
     TORRENT_PIECES("256KB Pieces", "BitTorrent Chunk Cache"),
     P2P_SWARM("Swarm & Tracker", "P2P Protocol Stack")
@@ -189,10 +189,22 @@ class TrinityViewModel(application: Application) : AndroidViewModel(application)
         ragServer.peerManager.addManualPeer(address, port, name)
     }
 
-    // --- HYBRID RAG CLOUD AI BRIDGE STATE ---
+    // --- CHATGPT OAUTH PKCE & HYBRID RAG CLOUD BRIDGE STATE ---
     val hybridCloudBridge = com.example.trinity.cloud.HybridCloudBridge(ragServer)
-    val selectedCloudProvider = MutableStateFlow(com.example.trinity.cloud.CloudProvider.GEMINI)
-    val cloudApiKey = MutableStateFlow("")
+    val mcpBridge = com.example.trinity.cloud.TrinityMCPBridge(ragServer)
+    val isMcpServerRunning = MutableStateFlow(false)
+
+    val openAiSession = MutableStateFlow<com.example.trinity.auth.OpenAIOAuthSession?>(null)
+    val isOpenAiAuthenticating = MutableStateFlow(false)
+    val openAiAuthStatus = MutableStateFlow<String?>(null)
+
+    val availableChatGptModels = MutableStateFlow(com.example.trinity.cloud.ChatGptModel.LATEST_MODELS)
+    val selectedChatGptModel = MutableStateFlow(com.example.trinity.cloud.ChatGptModel.LATEST_MODELS.first())
+    val selectedReasoningEffort = MutableStateFlow<String?>(null)
+
+    val customApiKey = MutableStateFlow("")
+    val customModelInput = MutableStateFlow("")
+    val isFetchingModels = MutableStateFlow(false)
     val hybridInputPrompt = MutableStateFlow("")
     val isHybridQuerying = MutableStateFlow(false)
     val lastToolCallEvent = MutableStateFlow<com.example.trinity.cloud.ToolCallEvent?>(null)
@@ -201,13 +213,104 @@ class TrinityViewModel(application: Application) : AndroidViewModel(application)
         listOf(
             com.example.trinity.cloud.HybridChatMessage(
                 role = "assistant",
-                content = "Trinity Hybrid Cloud AI connected. I act as the central cognitive reasoner (Gemini / GPT-4o / Claude). I have zero local storage and will invoke your local 'trinity_query' tool on-demand to retrieve verified 256KB SHA-256 chunks from your private P2P swarm.",
-                provider = com.example.trinity.cloud.CloudProvider.GEMINI,
+                content = "Trinity Hybrid Cloud AI connected via ChatGPT OAuth PKCE. I act as the central cognitive thinker (GPT-4o / GPT-4.5 / o1 / o3-mini). I have zero local storage and will invoke your local 'trinity_query' tool on-demand to retrieve verified 256KB SHA-256 chunks from your private P2P swarm.",
+                modelId = "gpt-4o",
                 isGrounded = true
             )
         )
     )
     val hybridChatMessages: StateFlow<List<com.example.trinity.cloud.HybridChatMessage>> = _hybridChatMessages.asStateFlow()
+
+    fun loadOpenAiSession(context: android.content.Context) {
+        val session = com.example.trinity.auth.OpenAIOAuthManager.loadSession(context)
+        openAiSession.value = session
+        fetchDynamicModels()
+        startMcpServer()
+    }
+
+    fun startMcpServer() {
+        viewModelScope.launch {
+            val success = mcpBridge.startServer()
+            isMcpServerRunning.value = success
+        }
+    }
+
+    fun stopMcpServer() {
+        mcpBridge.stopServer()
+        isMcpServerRunning.value = false
+    }
+
+    fun fetchDynamicModels() {
+        val token = customApiKey.value.takeIf { it.isNotBlank() } ?: openAiSession.value?.accessToken ?: return
+        val accountId = openAiSession.value?.accountId
+
+        viewModelScope.launch {
+            isFetchingModels.value = true
+            val fetched = hybridCloudBridge.fetchAvailableModels(token, accountId)
+            availableChatGptModels.value = fetched
+            isFetchingModels.value = false
+        }
+    }
+
+    fun applyCustomModelInput(modelId: String = customModelInput.value) {
+        val trimmed = modelId.trim()
+        if (trimmed.isNotBlank()) {
+            val customModel = com.example.trinity.cloud.ChatGptModel.custom(trimmed)
+            val currentList = availableChatGptModels.value.toMutableList()
+            if (currentList.none { it.id == customModel.id }) {
+                currentList.add(0, customModel)
+                availableChatGptModels.value = currentList
+            }
+            selectChatGptModel(customModel)
+        }
+    }
+
+    fun startOpenAiPkceLogin(context: android.content.Context) {
+        isOpenAiAuthenticating.value = true
+        openAiAuthStatus.value = "Starting ChatGPT OAuth PKCE flow..."
+
+        viewModelScope.launch {
+            val result = com.example.trinity.auth.OpenAIOAuthManager.authenticate(
+                context = context,
+                onStatusUpdate = { status ->
+                    openAiAuthStatus.value = status
+                }
+            )
+
+            result.onSuccess { session ->
+                openAiSession.value = session
+                isOpenAiAuthenticating.value = false
+                openAiAuthStatus.value = "Connected to ChatGPT (Account: ${session.accountId.take(12)}...)"
+            }.onFailure { error ->
+                isOpenAiAuthenticating.value = false
+                openAiAuthStatus.value = "Authentication failed: ${error.message ?: "Unknown error"}"
+            }
+        }
+    }
+
+    fun refreshOpenAiSession(context: android.content.Context) {
+        viewModelScope.launch {
+            openAiAuthStatus.value = "Refreshing OpenAI session token..."
+            val result = com.example.trinity.auth.OpenAIOAuthManager.refreshIfNeeded(context)
+            result.onSuccess { refreshed ->
+                openAiSession.value = refreshed
+                openAiAuthStatus.value = "ChatGPT Token refreshed successfully."
+            }.onFailure { err ->
+                openAiAuthStatus.value = "Refresh failed: ${err.message}"
+            }
+        }
+    }
+
+    fun disconnectOpenAi(context: android.content.Context) {
+        com.example.trinity.auth.OpenAIOAuthManager.clearSession(context)
+        openAiSession.value = null
+        openAiAuthStatus.value = "ChatGPT OAuth session disconnected."
+    }
+
+    fun selectChatGptModel(model: com.example.trinity.cloud.ChatGptModel) {
+        selectedChatGptModel.value = model
+        selectedReasoningEffort.value = model.defaultReasoning
+    }
 
     fun executeHybridQuery(prompt: String = hybridInputPrompt.value) {
         val trimmed = prompt.trim()
@@ -216,7 +319,7 @@ class TrinityViewModel(application: Application) : AndroidViewModel(application)
         val userMsg = com.example.trinity.cloud.HybridChatMessage(
             role = "user",
             content = trimmed,
-            provider = selectedCloudProvider.value
+            modelId = selectedChatGptModel.value.id
         )
         _hybridChatMessages.value = _hybridChatMessages.value + userMsg
         hybridInputPrompt.value = ""
@@ -226,8 +329,10 @@ class TrinityViewModel(application: Application) : AndroidViewModel(application)
             try {
                 val response = hybridCloudBridge.executeHybridQuery(
                     userPrompt = trimmed,
-                    provider = selectedCloudProvider.value,
-                    customApiKey = cloudApiKey.value.takeIf { it.isNotBlank() },
+                    selectedModel = selectedChatGptModel.value,
+                    reasoningEffort = selectedReasoningEffort.value,
+                    oauthSession = openAiSession.value,
+                    customApiKey = customApiKey.value.takeIf { it.isNotBlank() },
                     onToolCallExecuted = { event ->
                         lastToolCallEvent.value = event
                     }
@@ -236,8 +341,8 @@ class TrinityViewModel(application: Application) : AndroidViewModel(application)
             } catch (e: Exception) {
                 _hybridChatMessages.value = _hybridChatMessages.value + com.example.trinity.cloud.HybridChatMessage(
                     role = "assistant",
-                    content = "Error during Hybrid Cloud Bridge call: ${e.localizedMessage}",
-                    provider = selectedCloudProvider.value
+                    content = "Error during ChatGPT Hybrid Bridge call: ${e.localizedMessage}",
+                    modelId = selectedChatGptModel.value.id
                 )
             } finally {
                 isHybridQuerying.value = false

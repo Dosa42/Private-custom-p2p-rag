@@ -5,6 +5,10 @@ import org.junit.Assert.*
 import org.junit.Test
 import kotlin.random.Random
 
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+
+@RunWith(RobolectricTestRunner::class)
 class ExampleUnitTest {
   @Test
   fun addition_isCorrect() {
@@ -78,33 +82,61 @@ class ExampleUnitTest {
   }
 
   @Test
-  fun hybrid_cloud_bridge_executes_forced_tool_use_with_kappa_weighting() = kotlinx.coroutines.runBlocking {
+  fun chatgpt_oauth_and_hybrid_bridge_executes_forced_tool_use() = kotlinx.coroutines.runBlocking {
     val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
     val ragServer = com.example.trinity.core.TrinityRAGServer(context)
     val bridge = com.example.trinity.cloud.HybridCloudBridge(ragServer)
 
-    // Verify system prompt enforces Forced Tool Use and Kappa/TESSA interpretation
+    // Verify system prompt enforces Forced Tool Use and ChatGPT reasoning
     assertTrue("Prompt must enforce FORCED TOOL USE", bridge.systemPrompt.contains("FORCED TOOL USE"))
-    assertTrue("Prompt must interpret Kappa", bridge.systemPrompt.contains("KAPPA"))
+    assertTrue("Prompt must reference ChatGPT", bridge.systemPrompt.contains("ChatGPT"))
     assertTrue("Prompt must enforce TESSA", bridge.systemPrompt.contains("TESSA"))
 
     var toolCallInvoked = false
     var recordedEvent: com.example.trinity.cloud.ToolCallEvent? = null
 
+    val selectedModel = com.example.trinity.cloud.ChatGptModel.LATEST_MODELS.first()
     val response = bridge.executeHybridQuery(
         userPrompt = "Find sovereign records about network architecture",
-        provider = com.example.trinity.cloud.CloudProvider.GEMINI,
+        selectedModel = selectedModel,
         onToolCallExecuted = { event ->
             toolCallInvoked = true
             recordedEvent = event
         }
     )
 
-    assertTrue("Cloud AI must invoke local tool call", toolCallInvoked)
+    assertTrue("ChatGPT Cloud AI must invoke local tool call", toolCallInvoked)
     assertNotNull(recordedEvent)
     assertEquals("trinity_query", recordedEvent?.toolName)
     assertTrue("Integrity must be SHA-256 verified", recordedEvent?.integrityVerified == true)
     assertNotNull(response.content)
     assertTrue("Response must indicate hybrid bridge or grounded synthesis", response.content.isNotEmpty())
+  }
+
+  @Test
+  fun mcp_bridge_handles_json_rpc_and_plugin_manifest() = kotlinx.coroutines.runBlocking {
+    val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+    val ragServer = com.example.trinity.core.TrinityRAGServer(context)
+    val mcp = com.example.trinity.cloud.TrinityMCPBridge(ragServer)
+
+    // 1. Manifest checks
+    assertTrue("Manifest must contain schema version", mcp.aiPluginManifest.contains("schema_version"))
+    assertTrue("OpenAPI spec must contain paths", mcp.openApiSpec.contains("/mcp"))
+
+    // 2. Handshake initialize
+    val initReq = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"
+    val initResp = mcp.processMcpJsonRpc(initReq)
+    assertTrue("MCP initialize response must contain protocolVersion", initResp.contains("protocolVersion"))
+    assertTrue("MCP initialize response must contain 20024-11-05 or 2024-11-05", initResp.contains("2024-11-05"))
+
+    // 3. tools/list
+    val listReq = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
+    val listResp = mcp.processMcpJsonRpc(listReq)
+    assertTrue("tools/list must contain trinity_query", listResp.contains("trinity_query"))
+
+    // 4. tools/call
+    val callReq = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"trinity_query\",\"arguments\":{\"query\":\"network\"}}}"
+    val callResp = mcp.processMcpJsonRpc(callReq)
+    assertTrue("tools/call response must contain jsonrpc 2.0 result", callResp.contains("text"))
   }
 }
