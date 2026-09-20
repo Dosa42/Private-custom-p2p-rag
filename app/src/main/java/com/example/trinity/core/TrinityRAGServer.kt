@@ -2,7 +2,6 @@ package com.example.trinity.core
 
 import android.content.Context
 import com.example.trinity.model.KnowledgeChunk
-import com.example.trinity.model.SDCKClassification
 import com.example.trinity.model.SemanticVector
 import com.example.trinity.model.StorageTier
 import com.example.trinity.p2p.TrinityPeerManager
@@ -13,8 +12,8 @@ import com.example.trinity.tracker.TrinityTrackerServer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.File
 import java.security.MessageDigest
+import java.util.UUID
 
 data class IngestPipelineResult(
     val chunkId: String,
@@ -30,94 +29,98 @@ data class IngestPipelineResult(
     val vectorQuantization: String = "SQ8 (int8)",
     val vectorSavingsPercent: String = "74.5%",
     val vectorRawBytes: Int = 1536,
-    val vectorQuantizedBytes: Int = 393
+    val vectorQuantizedBytes: Int = 393,
+    val storedObjectId: String = ""
 )
 
-data class QueryResultItem(
-    val chunk: KnowledgeChunk,
-    val similarityScore: Float,
-    val mvsScore: Float
-)
+data class QueryResultItem(val chunk: KnowledgeChunk, val similarityScore: Float, val mvsScore: Float)
 
+/** Local RAG execution. Network adapters supply an authenticated owner independently of a session. */
 class TrinityRAGServer(context: Context) {
+    private val identity = context.getSharedPreferences("trinity_owner", Context.MODE_PRIVATE)
+    private val localOwnerId: String = identity.getString("local_owner_id", null) ?: run {
+        val generated = "local:" + UUID.randomUUID()
+        check(identity.edit().putString("local_owner_id", generated).commit()) { "Cannot persist local owner" }
+        generated
+    }
+
+    fun currentOwnerId(): String = identity.getString("current_owner_id", localOwnerId) ?: localOwnerId
 
     val semanticEngine = SemanticForceEngine(dimension = 384)
     val vectorIndex = TrinityVectorIndex(dimension = 384)
-    val metadataStore = TrinityMetadataStore(context)
+    val metadataStore = TrinityMetadataStore(context, legacyOwnerId = localOwnerId)
     val sdckCanon = SDCKCanon()
-    val storageManager = TrinityStorageManager(context)
+    val storageManager = TrinityStorageManager(context, ownerProvider = ::currentOwnerId)
     val torrentCache = TorrentPieceCache(context, pieceSize = 256 * 1024)
     val trackerServer = TrinityTrackerServer()
     val dht = com.example.trinity.dht.KademliaDHT(localPort = 6881)
     val peerManager = TrinityPeerManager(torrentCache = torrentCache, dht = dht)
-
-    // Direct RAM Bus: Active in-memory chunk cache for 0ms retrieval latency
     val inMemoryRAGCache = java.util.concurrent.ConcurrentHashMap<String, KnowledgeChunk>()
-
-    private val indexFile = File(context.filesDir, "trinity_vectors.idx")
 
     private val _lastPipelineResult = MutableStateFlow<IngestPipelineResult?>(null)
     val lastPipelineResult: StateFlow<IngestPipelineResult?> = _lastPipelineResult.asStateFlow()
-
     private val _chunksFlow = MutableStateFlow<List<KnowledgeChunk>>(emptyList())
     val chunksFlow: StateFlow<List<KnowledgeChunk>> = _chunksFlow.asStateFlow()
 
     init {
-        // Load existing index and chunks
-        vectorIndex.load(indexFile)
-
-        // Connect TorrentPieceCache directly to FAISS Vector Index in RAM
+        // SQLite stores complete vectors. Rebuild the derived in-memory index after every restart.
+        val recoveredObjects = storageManager.getAllObjects(localOwnerId)
+        for (storedChunk in metadataStore.getAllChunks()) {
+            val recovered = if (storedChunk.ownerId == localOwnerId && "storage_obj_id" !in storedChunk.metadata)
+                recoveredObjects.find { it.ownerId == localOwnerId && it.contentHash == sha256Hex(storedChunk.content) }
+                else null
+            val chunk = if (recovered == null) storedChunk else storedChunk.copy(metadata = storedChunk.metadata +
+                mapOf("storage_obj_id" to recovered.id, "owner_id" to storedChunk.ownerId))
+            if (recovered != null) check(metadataStore.storeChunk(chunk))
+            chunk.vector?.let { vectorIndex.add(chunk.chunkId, it.data) }
+            inMemoryRAGCache[chunk.chunkId] = chunk
+        }
+        torrentCache.adoptLegacyOwner(localOwnerId)
         torrentCache.onDirectMemoryVectorPush = { chunkId, content, vector, meta ->
-            // Direct In-Memory Engine: Push vector floats directly into FAISS search matrix in RAM
-            vectorIndex.add(chunkId, vector)
-            val liveChunk = KnowledgeChunk(
-                chunkId = chunkId,
-                content = content,
-                vector = SemanticVector(vector, dimension = vector.size, norm = 1.0f),
-                tier = StorageTier.HOT,
-                source = meta["source"] ?: "p2p_swarm",
-                sessionId = meta["session_id"] ?: "IN_MEMORY_LIVE",
-                kappa = meta["kappa"]?.toFloatOrNull() ?: 0.85f,
-                tessaName = meta["tessa_name"] ?: "BENEFIT_ACCEL_EFF",
-                metadata = meta
-            )
-            inMemoryRAGCache[chunkId] = liveChunk
+            importVerifiedChunk(chunkId, content, vector, meta)
+        }
+        storageManager.onTierChangeListener = { objId, _, newTier ->
+            for (chunk in metadataStore.getAllChunks()) {
+                if (chunk.metadata["storage_obj_id"] == objId) {
+                    metadataStore.updateTier(chunk.chunkId, newTier)
+                    inMemoryRAGCache[chunk.chunkId]?.tier = newTier
+                }
+            }
             refreshChunks()
         }
-
+        // Complete only an adoption previously initiated by a verified pairing before a crash.
+        identity.getString("pending_adoption", null)?.let(::bindAuthenticatedOwner)
         refreshChunks()
-
-        // Sync tier migrations
-        storageManager.onTierChangeListener = { objId, oldTier, newTier ->
-            metadataStore.updateTier(objId, newTier)
-            refreshChunks()
-        }
-
-        // Seed initial sample knowledge if empty
-        if (metadataStore.getAllChunks().isEmpty()) {
-            seedInitialKnowledge()
-        }
     }
 
+    /** Called only with the principal returned by verified gateway pairing, never tool arguments. */
+    @Synchronized
+    fun bindAuthenticatedOwner(ownerId: String) {
+        require(ownerId.isNotBlank()) { "Authenticated owner is required" }
+        if (!identity.getBoolean("local_owner_adopted", false)) {
+            val pending = identity.getString("pending_adoption", null)
+            require(pending == null || pending == ownerId) { "A previous owner adoption must complete first" }
+            check(identity.edit().putString("pending_adoption", ownerId).commit())
+            storageManager.adoptOwner(localOwnerId, ownerId)
+            metadataStore.adoptOwner(localOwnerId, ownerId)
+            torrentCache.adoptOwner(localOwnerId, ownerId)
+            check(identity.edit().putBoolean("local_owner_adopted", true)
+                .putString("current_owner_id", ownerId).remove("pending_adoption").commit())
+        } else {
+            // Account switches select an owner; they do not transfer the previous owner's data.
+            check(identity.edit().putString("current_owner_id", ownerId).commit())
+        }
+        inMemoryRAGCache.clear()
+        metadataStore.getAllChunks().forEach { inMemoryRAGCache[it.chunkId] = it }
+        refreshChunks()
+    }
+
+    @Synchronized
     fun refreshChunks() {
-        val map = mutableMapOf<String, KnowledgeChunk>()
-        for (c in metadataStore.getAllChunks()) {
-            map[c.chunkId] = c
-        }
-        for ((k, c) in inMemoryRAGCache) {
-            map[k] = c
-        }
-        _chunksFlow.value = map.values.toList()
+        _chunksFlow.value = metadataStore.getAllChunks(ownerId = currentOwnerId())
     }
 
-    /**
-     * Executes the complete 5-layer pipeline from the architecture diagram:
-     * 1. trinity_core: calculates Kappa & TESSA
-     * 2. Semantic vector generation & SDCK classification
-     * 3. trinity_storage: physical storage in HOT/WARM/COLD tiers
-     * 4. torrent_cache: splits into 256 KB SHA-256 pieces
-     * 5. p2p_protocol & tracker_server: announce to swarm & peers
-     */
+    @Synchronized
     fun ingest(
         content: String,
         source: String = "hub",
@@ -126,157 +129,140 @@ class TrinityRAGServer(context: Context) {
         g2: Float = 0.5f,
         g3: Float = 0.8f,
         g4: Float = 0.2f,
-        metadata: Map<String, String> = emptyMap()
+        metadata: Map<String, String> = emptyMap(),
+        ownerId: String = currentOwnerId()
     ): IngestPipelineResult {
-        // Step 1: Calculate Kappa and TESSA Classification
+        require(ownerId.isNotBlank()) { "Chunk owner is required" }
         val kappa = TessaClassifier.kappaFromGVec(g1, g2, g3, g4)
         val tessa = TessaClassifier.classify(kappa)
-
-        val chunkId = sha256Hex(content + source + sessionId).take(24)
-
-        // Step 2: Semantic Vector Embedding
+        val chunkId = sha256Hex(listOf(ownerId, source, sessionId, content).joinToString("") {
+            "${it.toByteArray(Charsets.UTF_8).size}:$it"
+        })
         val vector = semanticEngine.embed(content)
-
-        val chunk = KnowledgeChunk(
-            chunkId = chunkId,
-            content = content,
-            vector = vector,
-            tier = tessa.tier,
-            source = source,
-            sessionId = sessionId,
-            kappa = kappa,
-            tessaName = tessa.name,
-            metadata = metadata
-        )
-
-        // SDCK Canon evaluation
-        val sdck = sdckCanon.classify(chunk)
-        chunk.tier = sdck.tier
-        chunk.confidence = sdck.confidence
-
-        // Save to Vector Index & SQLite
+        val meta = metadata + mapOf("owner_id" to ownerId, "source" to source, "session_id" to sessionId,
+            "kappa" to kappa.toString(), "tessa_name" to tessa.name)
+        val initial = KnowledgeChunk(chunkId = chunkId, content = content, vector = vector,
+            tier = tessa.tier, source = source, sessionId = sessionId, kappa = kappa,
+            tessaName = tessa.name, metadata = meta, ownerId = ownerId)
+        val sdck = sdckCanon.classify(initial)
+        val previous = metadataStore.getChunk(chunkId, ownerId)
+        val previousObject = previous?.metadata?.get("storage_obj_id")?.let { id ->
+            storageManager.getAllObjects(ownerId).find { it.id == id && it.ownerId == ownerId }
+        }?.takeIf { storageManager.retrieve(it.id, ownerId)?.contentEquals(content.toByteArray(Charsets.UTF_8)) == true }
+        val stored = previousObject ?: checkNotNull(storageManager.store(
+            data = content.toByteArray(Charsets.UTF_8), ownerId = ownerId, tier = sdck.tier, metadata = meta
+        )) { "Storage quota exceeded" }
+        val chunk = initial.copy(tier = stored.tier, confidence = sdck.confidence,
+            metadata = meta + mapOf("storage_obj_id" to stored.id, "tier" to stored.tier.value))
+        check(metadataStore.storeChunk(chunk)) { "Could not persist knowledge chunk" }
         vectorIndex.add(chunkId, vector.data)
-        vectorIndex.save(indexFile)
-        metadataStore.storeChunk(chunk)
-
-        // Direct In-Memory Engine: Register into active RAM cache & FAISS matrix (0ms disk wait)
         inMemoryRAGCache[chunkId] = chunk
-        vectorIndex.add(chunkId, vector.data)
-
-        // Step 3: Physical Tiered Storage (Async background write-behind)
-        val storedObj = storageManager.store(
-            data = content.toByteArray(Charsets.UTF_8),
-            ownerId = sessionId,
-            tier = chunk.tier,
-            metadata = metadata
-        )
-
-        // Step 4: Split into 256 KB Torrent Pieces with SQ8 Vector Quantization
-        val infoHash = torrentCache.addChunk(
-            chunkId = chunkId,
-            content = content,
-            vectorBytes = null,
-            rawVector = vector.data,
-            metadata = metadata
-        )
-
-        // Step 5: Announce to Tracker & P2P Swarm
-        trackerServer.announce(
-            infoHash = infoHash,
-            peerId = peerManager.localPeerId,
-            ip = "127.0.0.1",
-            port = peerManager.listenPort,
-            event = "completed",
-            uploaded = 0L,
-            downloaded = content.length.toLong()
-        )
+        val infoHash = torrentCache.addChunk(chunkId = chunkId, content = content,
+            rawVector = vector.data, metadata = chunk.metadata)
         peerManager.announceTorrent(infoHash)
-
         refreshChunks()
-
-        val result = IngestPipelineResult(
-            chunkId = chunkId,
-            infoHash = infoHash,
-            kappa = kappa,
-            tessaName = tessa.name,
-            tessaPermission = tessa.permission,
-            tier = chunk.tier,
-            sdckScore = sdck.score,
-            pieceCount = torrentCache.getTorrentMeta(infoHash)?.pieceIds?.size ?: 1,
-            totalBytes = content.toByteArray(Charsets.UTF_8).size.toLong(),
-            storagePath = storedObj?.path ?: "storage/${chunk.tier.value}/$chunkId"
-        )
-
-        _lastPipelineResult.value = result
-        return result
+        return IngestPipelineResult(
+            chunkId = chunkId, infoHash = infoHash, kappa = kappa, tessaName = tessa.name,
+            tessaPermission = tessa.permission, tier = chunk.tier, sdckScore = sdck.score,
+            pieceCount = checkNotNull(torrentCache.getTorrentMeta(infoHash)).pieceIds.size,
+            totalBytes = content.toByteArray(Charsets.UTF_8).size.toLong(), storagePath = stored.path,
+            storedObjectId = stored.id
+        ).also { _lastPipelineResult.value = it }
     }
 
+    /** The piece transport validates origin, owner, payload and hashes before invoking this callback. */
+    @Synchronized
+    private fun importVerifiedChunk(chunkId: String, content: String, data: FloatArray, meta: Map<String, String>) {
+        val ownerId = requireNotNull(meta["owner_id"]) { "Received chunk has no authenticated owner" }
+        require(ownerId == currentOwnerId()) { "Received chunk belongs to another owner" }
+        // delete() holds the same RAG monitor; a delivery captured before deletion cannot recreate it.
+        check(!torrentCache.isChunkDeleted(ownerId, chunkId)) { "Received chunk was deleted locally" }
+        // Content-only peers intentionally omit a vector; generate it with the same local engine.
+        val vectorData = if (data.isEmpty()) semanticEngine.embed(content).data else data
+        require(vectorData.size == semanticEngine.dimension && vectorData.all { it.isFinite() }) { "Invalid received vector" }
+        val existing = metadataStore.getChunk(chunkId)
+        require(existing == null || existing.ownerId == ownerId) { "Received chunk id belongs to another owner" }
+        if (existing != null) {
+            require(existing.content == content) { "Received chunk id has conflicting content" }
+            return
+        }
+        val tier = StorageTier.fromString(meta["tier"] ?: "warm")
+        val stored = checkNotNull(storageManager.store(content.toByteArray(Charsets.UTF_8), ownerId, tier, meta)) {
+            "Storage quota exceeded while importing peer data"
+        }
+        val chunk = KnowledgeChunk(chunkId = chunkId, content = content, vector = SemanticVector(vectorData),
+            tier = tier, source = meta["source"] ?: "p2p_swarm", sessionId = meta["session_id"] ?: "",
+            kappa = meta["kappa"]?.toFloatOrNull() ?: 0.5f, tessaName = meta["tessa_name"] ?: "BENEFIT_STABLE",
+            metadata = meta + ("storage_obj_id" to stored.id), ownerId = ownerId)
+        check(metadataStore.storeChunk(chunk)) { "Could not persist received knowledge chunk" }
+        vectorIndex.add(chunkId, vectorData)
+        inMemoryRAGCache[chunkId] = chunk
+        refreshChunks()
+    }
+
+    @Synchronized
     fun query(
         queryText: String,
         k: Int = 5,
         minKappa: Float = 0.0f,
-        tierFilter: StorageTier? = null
+        tierFilter: StorageTier? = null,
+        ownerId: String = currentOwnerId()
     ): List<QueryResultItem> {
-        val queryVec = semanticEngine.embed(queryText)
-        val rawHits = vectorIndex.search(queryVec.data, k = k * 3)
-
-        val results = mutableListOf<QueryResultItem>()
-        for ((chunkId, sim) in rawHits) {
-            val chunk = inMemoryRAGCache[chunkId] ?: metadataStore.getChunk(chunkId) ?: continue
-            if (chunk.kappa < minKappa) continue
-            if (tierFilter != null && chunk.tier != tierFilter) continue
-
-            metadataStore.updateAccess(chunkId)
+        require(ownerId.isNotBlank())
+        require(k >= 0)
+        val allowed = metadataStore.getAllChunks(ownerId = ownerId)
+            .filter { it.kappa >= minKappa && (tierFilter == null || it.tier == tierFilter) }
+            .associateBy { it.chunkId }
+        val queryVector = semanticEngine.embed(queryText)
+        // Filter eligible owners before ranking/top-k, so other owners cannot displace valid hits.
+        val hits = vectorIndex.search(queryVector.data, k, allowed.keys)
+        val results = hits.map { (id, similarity) ->
+            val chunk = checkNotNull(allowed[id])
+            metadataStore.updateAccess(id)
             chunk.accessCount++
-
-            // Calculate Multi-Vector Significance (MVS)
-            val mvs = chunk.vector?.let { semanticEngine.computeSimilarity(it, queryVec) } ?: sim
+            val mvs = chunk.vector?.let { semanticEngine.computeSimilarity(it, queryVector) } ?: similarity
             chunk.mvsScore = mvs
-
-            results.add(QueryResultItem(chunk, sim, mvs))
-            if (results.size >= k) break
+            QueryResultItem(chunk, similarity, mvs)
         }
-
-        metadataStore.logQuery(queryText, "${results.size} hits")
+        metadataStore.logQuery(queryText, "${results.size} hits", ownerId)
         return results
     }
 
-    fun buildLlmContext(queryText: String, k: Int = 5): String {
-        val hits = query(queryText, k = k)
-        if (hits.isEmpty()) return "Trinity RAG: No matching context located in swarm memory."
+    fun retrieve(objId: String, ownerId: String = currentOwnerId()): ByteArray? =
+        storageManager.retrieve(objId, ownerId)
 
-        val sb = StringBuilder()
-        sb.appendLine("[Trinity Core RAG Context — ${hits.size} chunks retrieved from decentralized memory]")
-        for ((idx, hit) in hits.withIndex()) {
-            val c = hit.chunk
-            sb.appendLine("[${idx + 1}] Source: ${c.source.uppercase()} | Tier: ${c.tier.value.uppercase()} | κ: ${"%.3f".format(c.kappa)} | Tessa: ${c.tessaName} | Sim: ${"%.1f".format(hit.similarityScore * 100)}%")
-            sb.appendLine(c.content.trim())
-            sb.appendLine()
+    @Synchronized
+    fun delete(objId: String, ownerId: String = currentOwnerId()): Boolean {
+        val affected = metadataStore.getAllChunks().filter { it.metadata["storage_obj_id"] == objId }
+        if (!storageManager.delete(objId, ownerId)) return false
+        for (chunk in affected) {
+            check(metadataStore.removeChunk(chunk.chunkId, chunk.ownerId))
+            vectorIndex.remove(chunk.chunkId)
+            inMemoryRAGCache.remove(chunk.chunkId)
+            torrentCache.removeChunk(chunk.chunkId, chunk.ownerId)
         }
-        return sb.toString().trim()
+        refreshChunks()
+        return true
     }
 
-    private fun seedInitialKnowledge() {
-        ingest(
-            content = "UAGL TESSA protocol enforces deterministic tiering based on guardian kappa vectors. Benefit accelerate efficient status maps to hot storage.",
-            source = "guardian",
-            g1 = 0.95f, g2 = 0.85f, g3 = 0.90f, g4 = 0.80f
-        )
-        ingest(
-            content = "Kral brotherhood memory node operates distributed vector similarity over FAISS indexes with 384-dimensional semantic force projections.",
-            source = "kral",
-            g1 = 0.80f, g2 = 0.70f, g3 = 0.75f, g4 = 0.60f
-        )
-        ingest(
-            content = "BitTorrent chunking splits ingested RAG data into 256 KB content-addressable SHA-256 pieces synchronized across multi-node swarms.",
-            source = "hub",
-            g1 = 0.65f, g2 = 0.60f, g3 = 0.55f, g4 = 0.40f
-        )
+    fun buildLlmContext(queryText: String, k: Int = 5, ownerId: String = currentOwnerId()): String {
+        val hits = query(queryText, k = k, ownerId = ownerId)
+        if (hits.isEmpty()) return "Trinity RAG: No matching context located."
+        return buildString {
+            appendLine("[Trinity Core RAG Context — ${hits.size} chunks]")
+            hits.forEachIndexed { idx, hit ->
+                appendLine("[${idx + 1}] Source: ${hit.chunk.source} | Tier: ${hit.chunk.tier.value} | Sim: ${hit.similarityScore}")
+                appendLine(hit.chunk.content.trim())
+                appendLine()
+            }
+        }.trim()
     }
 
-    private fun sha256Hex(text: String): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        val bytes = md.digest(text.toByteArray(Charsets.UTF_8))
-        return bytes.joinToString("") { "%02x".format(it) }
+    fun close() {
+        peerManager.stop()
+        metadataStore.close()
     }
+
+    private fun sha256Hex(text: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }

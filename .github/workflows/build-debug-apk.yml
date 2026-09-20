@@ -76,7 +76,7 @@ jobs:
 
       # 3. Gradle 9.1+ Setup
       - name: Setup Gradle 9.3+
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5.0.2
         with:
           gradle-version: '9.3.1'
           cache-read-only: false
@@ -130,6 +130,10 @@ jobs:
           kotlin.compiler.execution.strategy=in-process
           EOF
           echo "✓ gradle.properties patched with CI-safe JVM constraints"
+
+      - name: Run Android ownership, MCP, relay and peer regression tests
+        shell: bash
+        run: ./gradlew :app:testDebugUnitTest --stacktrace 2>&1 | tee android-tests.log
 
       # 5. Dynamic Self-Fixing Build Execution (Anti-Error-Loop System)
       - name: Build Debug APK with Dynamic Self-Healing Engine
@@ -259,8 +263,30 @@ jobs:
         with:
           name: build-failure-diagnostics
           path: |
+            android-tests.log
             build_attempt1.log
             build_attempt2.log
             app/build/reports/
           retention-days: 7
           if-no-files-found: ignore
+
+  gateway-tests:
+    name: OAuth and MCP gateway integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            services/trinity_gateway/requirements.lock
+            services/trinity_gateway/requirements-test.lock
+      - name: Install pinned gateway dependencies
+        run: |
+          python -m pip install -r services/trinity_gateway/requirements.lock -r services/trinity_gateway/requirements-test.lock
+          python -m pip install --no-deps -e services/trinity_gateway
+          python -m pip check
+      - name: Run real OAuth, SDK and WebSocket integration tests
+        run: python -m pytest services/trinity_gateway/tests -q

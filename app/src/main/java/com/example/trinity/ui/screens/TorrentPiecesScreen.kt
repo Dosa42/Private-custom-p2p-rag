@@ -365,7 +365,7 @@ fun TorrentPiecesScreen(
                             }
 
                             Button(
-                                onClick = { viewModel.simulatePieceExchange(activeTorrent.infoHash) },
+                                onClick = { viewModel.downloadPieces(activeTorrent.infoHash) },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = TrinityElectricBlue,
                                     contentColor = TrinityDeepNavy

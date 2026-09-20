@@ -91,7 +91,8 @@ data class KnowledgeChunk(
     var lastAccessed: Long = System.currentTimeMillis(),
     val createdAt: Long = System.currentTimeMillis(),
     val metadata: Map<String, String> = emptyMap(),
-    var mvsScore: Float = 0f
+    var mvsScore: Float = 0f,
+    val ownerId: String = ""
 )
 
 data class TorrentMeta(

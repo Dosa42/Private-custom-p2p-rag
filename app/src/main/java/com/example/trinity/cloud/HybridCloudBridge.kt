@@ -3,6 +3,12 @@ package com.example.trinity.cloud
 import com.example.trinity.auth.OpenAIOAuthSession
 import com.example.trinity.core.TrinityRAGServer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -10,20 +16,32 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+class AuthExpiredException(val rejectedAccessToken: String) : IOException("Authentication rejected (HTTP 401). Refresh the session or log in again.")
+
+/** ChatGPT OAuth uses the Codex Responses backend; API keys use the public Responses API. */
 class HybridCloudBridge(
-    private val ragServer: TrinityRAGServer
-) {
-    private val httpClient = OkHttpClient.Builder()
+    private val ragServer: TrinityRAGServer,
+    private val mcpBridge: TrinityMCPBridge = TrinityMCPBridge(ragServer),
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
+) {
+    companion object {
+        // Protocol shape checked against openai/codex; this is wire compatibility, not app identity.
+        private const val CODEX_CLIENT_VERSION = "0.155.1"
+        private const val CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+        private const val API_BASE = "https://api.openai.com/v1"
+    }
 
     val systemPrompt: String = """
         You are the Central Cognitive Reasoner of the Trinity Hybrid RAG framework powered by ChatGPT.
-        You run in the cloud and DO NOT have direct access to the user's private computer, local RAM, or FAISS vector matrix.
+        You run in the cloud and DO NOT have direct access to the user's private computer, local RAM, or local vector index.
         Your role is purely cognitive: reasoning, language synthesis, and code generation.
         The local standalone framework acts as your sovereign on-demand data provider.
 
@@ -34,70 +52,21 @@ class HybridCloudBridge(
            - Sovereign Truth (κ >= 0.85, TESSA: BENEFIT_ACCEL_EFF): Primary weight. Base your deductions on this.
            - Verified Consensus (0.70 <= κ < 0.85, TESSA: HARMONIC_BALANCE / NEUTRAL): Standard weight.
            - Transitory / Quarantined (κ < 0.70, TESSA: THREAT_DECEL / QUARANTINE_ISOLATE): Low weight. You must state warnings or caveats.
-        3. DATA INTEGRITY: The local framework verified all returned chunks via 256 KB SHA-256 pieces over a private P2P swarm.
+        3. DATA INTEGRITY: Report integrity verification only when the tool result explicitly confirms it. Retrieved content sent to this cloud model has left the device.
     """.trimIndent()
 
-    suspend fun fetchAvailableModels(
-        token: String,
-        accountId: String? = null
-    ): List<ChatGptModel> = withContext(Dispatchers.IO) {
-        if (token.isBlank()) return@withContext ChatGptModel.LATEST_MODELS
-
-        val reqBuilder = Request.Builder()
-            .url("https://api.openai.com/v1/models")
-            .addHeader("Authorization", "Bearer $token")
-            .get()
-
-        if (!accountId.isNullOrBlank()) {
-            reqBuilder.addHeader("ChatGPT-Account-ID", accountId)
+    suspend fun fetchAvailableModels(token: String, accountId: String? = null): List<ChatGptModel> =
+        withContext(Dispatchers.IO) {
+            require(token.isNotBlank()) { "Log in or provide an API key before loading models." }
+            val oauth = !accountId.isNullOrBlank()
+            val url = if (oauth) "$CODEX_BASE/models?client_version=$CODEX_CLIENT_VERSION" else "$API_BASE/models"
+            httpClient.newCall(authenticatedRequest(url, token, accountId).get().build()).execute().use { response ->
+                if (response.code == 401) throw AuthExpiredException(token)
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) throw IOException(providerError(response.code, raw))
+                parseModels(JSONObject(raw), oauth)
+            }
         }
-
-        try {
-            val resp = httpClient.newCall(reqBuilder.build()).execute()
-            val raw = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                return@withContext ChatGptModel.LATEST_MODELS
-            }
-
-            val json = JSONObject(raw)
-            val data = json.optJSONArray("data") ?: return@withContext ChatGptModel.LATEST_MODELS
-            val parsedModels = mutableListOf<ChatGptModel>()
-
-            for (i in 0 until data.length()) {
-                val item = data.getJSONObject(i)
-                val id = item.optString("id", "")
-                if (id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4") || id.startsWith("chatgpt-") || id.startsWith("ft:")) {
-                    val isReasoning = id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")
-                    parsedModels.add(
-                        ChatGptModel(
-                            id = id,
-                            name = id,
-                            description = "Dynamic OpenAI model returned from API.",
-                            defaultReasoning = if (isReasoning) "medium" else null,
-                            reasoningLevels = if (isReasoning) listOf("low", "medium", "high") else emptyList(),
-                            acceptsImages = !id.contains("o1-mini")
-                        )
-                    )
-                }
-            }
-
-            if (parsedModels.isNotEmpty()) {
-                // Ensure default models are also present if not returned
-                val idSet = parsedModels.map { it.id }.toSet()
-                val merged = parsedModels.toMutableList()
-                for (def in ChatGptModel.LATEST_MODELS) {
-                    if (def.id !in idSet) {
-                        merged.add(def)
-                    }
-                }
-                merged
-            } else {
-                ChatGptModel.LATEST_MODELS
-            }
-        } catch (e: Exception) {
-            ChatGptModel.LATEST_MODELS
-        }
-    }
 
     suspend fun executeHybridQuery(
         userPrompt: String,
@@ -105,270 +74,227 @@ class HybridCloudBridge(
         reasoningEffort: String? = null,
         oauthSession: OpenAIOAuthSession? = null,
         customApiKey: String? = null,
-        onToolCallExecuted: ((ToolCallEvent) -> Unit)? = null
+        onToolCallExecuted: ((ToolCallEvent) -> Unit)? = null,
+        refreshSession: (suspend (String) -> OpenAIOAuthSession)? = null
     ): HybridChatMessage = withContext(Dispatchers.IO) {
-        val token = customApiKey?.takeIf { it.isNotBlank() } ?: oauthSession?.accessToken
+        require(userPrompt.isNotBlank()) { "Enter a prompt." }
+        require(selectedModel.id.isNotBlank()) { "Load and select a model, or enter a model ID." }
+        val apiKey = customApiKey?.takeIf { it.isNotBlank() }
+        var session = if (apiKey == null) oauthSession else null
+        var token = apiKey ?: session?.accessToken
+            ?: throw IllegalStateException("No ChatGPT session or API key. Log in before sending a message.")
+        val endpoint = if (session != null) "$CODEX_BASE/responses" else "$API_BASE/responses"
+        val tools = responseTools(mcpBridge.listTools())
+        val input = JSONArray().put(JSONObject().put("role", "user").put("content", userPrompt))
+        var lastToolEvent: ToolCallEvent? = null
+        var grounded = false
+        val ownerId = ragServer.currentOwnerId()
 
-        if (token.isNullOrBlank()) {
-            return@withContext executeEmulatedHybridQuery(userPrompt, selectedModel, onToolCallExecuted)
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val payload = JSONObject().apply {
+                put("model", selectedModel.id)
+                put("instructions", systemPrompt)
+                put("input", input)
+                put("tools", tools)
+                put("tool_choice", "auto")
+                put("parallel_tool_calls", true)
+                put("store", false)
+                put("stream", true)
+                put("include", JSONArray().put("reasoning.encrypted_content"))
+                if (!reasoningEffort.isNullOrBlank()) put("reasoning", JSONObject().put("effort", reasoningEffort))
+            }
+            // Retry just this network request. Previously executed MCP writes must never be replayed.
+            val output = try {
+                requestResponse(endpoint, payload, token, session?.accountId)
+            } catch (e: AuthExpiredException) {
+                if (session == null || refreshSession == null) throw e
+                session = refreshSession(e.rejectedAccessToken)
+                token = session.accessToken
+                requestResponse(endpoint, payload, token, session.accountId)
+            }
+            var calls = 0
+            val answer = StringBuilder()
+            for (i in 0 until output.length()) {
+                val item = output.getJSONObject(i)
+                input.put(item) // Preserve reasoning and function-call items for stateless continuation.
+                if (item.optString("type") == "message") {
+                    val content = item.optJSONArray("content") ?: continue
+                    for (j in 0 until content.length()) {
+                        val part = content.getJSONObject(j)
+                        val text = when (part.optString("type")) {
+                            "output_text" -> part.optString("text")
+                            "refusal" -> part.optString("refusal")
+                            else -> ""
+                        }
+                        if (text.isNotBlank()) {
+                            if (answer.isNotEmpty()) answer.append('\n')
+                            answer.append(text)
+                        }
+                    }
+                }
+            }
+            // All calls from a response are answered before asking the model to continue.
+            for (i in 0 until output.length()) {
+                val call = output.getJSONObject(i)
+                if (call.optString("type") != "function_call") continue
+                currentCoroutineContext().ensureActive()
+                calls++
+                val name = call.getString("name")
+                val args = JSONObject(call.getString("arguments"))
+                val start = System.nanoTime()
+                val result = mcpBridge.callTool(name, args, ownerId)
+                val event = toolEvent(name, args, result, (System.nanoTime() - start) / 1_000_000)
+                lastToolEvent = event
+                grounded = grounded || (name == "trinity_query" && !result.optBoolean("isError") && event.chunksReturnedCount > 0)
+                onToolCallExecuted?.invoke(event)
+                input.put(JSONObject().apply {
+                    put("type", "function_call_output")
+                    put("call_id", call.getString("call_id"))
+                    put("output", result.toString())
+                })
+            }
+            if (calls == 0) {
+                if (answer.isBlank()) throw IOException("Responses completed without an answer or a tool call.")
+                return@withContext HybridChatMessage(
+                    role = "assistant", content = answer.toString(), modelId = selectedModel.id,
+                    toolCall = lastToolEvent, isGrounded = grounded
+                )
+            }
         }
+        @Suppress("UNREACHABLE_CODE")
+        throw IllegalStateException("Unreachable")
+    }
 
+    private suspend fun requestResponse(endpoint: String, payload: JSONObject, token: String, accountId: String?): JSONArray = coroutineScope {
+        val request = authenticatedRequest(endpoint, token, accountId)
+            .header("Accept", "text/event-stream")
+            .post(payload.toString().toRequestBody("application/json".toMediaType())).build()
+        val call = httpClient.newCall(request)
+        // Close a blocked SSE socket immediately when the caller cancels its coroutine.
+        val cancellation = launch(start = CoroutineStart.UNDISPATCHED) {
+            try { awaitCancellation() } finally { call.cancel() }
+        }
         try {
-            executeChatGptFunctionCall(
-                userPrompt = userPrompt,
-                model = selectedModel,
-                reasoningEffort = reasoningEffort,
-                token = token,
-                accountId = oauthSession?.accountId,
-                onToolCallExecuted = onToolCallExecuted
-            )
-        } catch (e: Exception) {
-            val fallback = executeEmulatedHybridQuery(userPrompt, selectedModel, onToolCallExecuted)
-            fallback.copy(content = "[ChatGPT API Note: ${e.message ?: "Network error"}, used local hybrid bridge]\n\n" + fallback.content)
+            call.execute().use { response ->
+                if (response.code == 401) throw AuthExpiredException(token)
+                if (!response.isSuccessful) throw IOException(providerError(response.code, response.body?.string().orEmpty()))
+                val body = response.body ?: throw IOException("Responses returned an empty body.")
+                if (body.contentType()?.subtype != "event-stream") {
+                    throw IOException("Responses did not return the requested text/event-stream transport.")
+                }
+                body.charStream().buffered().use { reader ->
+                    readResponseEvents(reader) { currentCoroutineContext().ensureActive() }
+                }
+            }
+        } finally {
+            cancellation.cancel()
         }
     }
 
-    private fun executeChatGptFunctionCall(
-        userPrompt: String,
-        model: ChatGptModel,
-        reasoningEffort: String?,
-        token: String,
-        accountId: String?,
-        onToolCallExecuted: ((ToolCallEvent) -> Unit)?
-    ): HybridChatMessage {
-        val endpoint = "https://api.openai.com/v1/chat/completions"
+    private fun authenticatedRequest(url: String, token: String, accountId: String?): Request.Builder = Request.Builder()
+        .url(url).header("Authorization", "Bearer $token").header("User-Agent", "Trinity-Android/1.0")
+        .apply { if (!accountId.isNullOrBlank()) header("ChatGPT-Account-Id", accountId) }
 
-        val toolsArray = JSONArray().apply {
+    internal fun parseModels(json: JSONObject, oauth: Boolean): List<ChatGptModel> {
+        val entries = json.optJSONArray(if (oauth) "models" else "data")
+            ?: throw IOException("Model catalog has no ${if (oauth) "models" else "data"} array.")
+        return (0 until entries.length()).mapNotNull { index ->
+            val item = entries.getJSONObject(index)
+            val id = item.optString(if (oauth) "slug" else "id")
+            if (id.isBlank()) return@mapNotNull null
+            val levels = item.optJSONArray("supported_reasoning_levels")
+            val modalities = item.optJSONArray("input_modalities")
+            ChatGptModel(
+                id = id,
+                name = item.optString("display_name").ifBlank { id },
+                description = if (item.isNull("description")) "Returned by the authenticated model catalog." else item.optString("description"),
+                defaultReasoning = item.optString("default_reasoning_level").takeIf { it.isNotBlank() && it != "null" },
+                reasoningLevels = if (levels == null) emptyList() else (0 until levels.length())
+                    .mapNotNull { levels.optJSONObject(it)?.optString("effort")?.takeIf(String::isNotBlank) },
+                acceptsImages = modalities != null && (0 until modalities.length()).any { modalities.optString(it) == "image" }
+            )
+        }.distinctBy { it.id }
+    }
+
+    private fun responseTools(mcpTools: JSONArray): JSONArray = JSONArray().apply {
+        for (i in 0 until mcpTools.length()) {
+            val tool = mcpTools.getJSONObject(i)
             put(JSONObject().apply {
                 put("type", "function")
-                put("function", JSONObject().apply {
-                    put("name", "trinity_query")
-                    put("description", "Queries the local in-memory FAISS vector matrix and P2P torrent cache for sovereign knowledge chunks.")
-                    put("parameters", JSONObject().apply {
-                        put("type", "object")
-                        put("properties", JSONObject().apply {
-                            put("query", JSONObject().apply {
-                                put("type", "string")
-                                put("description", "Search query or concept to locate in the private network.")
-                            })
-                            put("min_kappa", JSONObject().apply {
-                                put("type", "number")
-                                put("description", "Minimum acceptable Kappa stability score between 0.0 and 1.0.")
-                            })
-                        })
-                        put("required", JSONArray().apply { put("query") })
-                    })
-                })
+                put("name", tool.getString("name"))
+                put("description", tool.optString("description"))
+                put("parameters", tool.getJSONObject("inputSchema"))
+                put("strict", false)
             })
-        }
-
-        val messagesArray = JSONArray().apply {
-            put(JSONObject().apply {
-                put("role", "system")
-                put("content", systemPrompt)
-            })
-            put(JSONObject().apply {
-                put("role", "user")
-                put("content", userPrompt)
-            })
-        }
-
-        val requestBody1 = JSONObject().apply {
-            put("model", model.id)
-            put("messages", messagesArray)
-            put("tools", toolsArray)
-            put("tool_choice", "auto")
-            if (reasoningEffort != null && reasoningEffort != "none") {
-                put("reasoning_effort", reasoningEffort)
-            }
-        }
-
-        val reqBuilder1 = Request.Builder()
-            .url(endpoint)
-            .addHeader("Authorization", "Bearer $token")
-            .post(requestBody1.toString().toRequestBody("application/json".toMediaType()))
-
-        if (!accountId.isNullOrBlank()) {
-            reqBuilder1.addHeader("ChatGPT-Account-ID", accountId)
-        }
-
-        val resp1 = httpClient.newCall(reqBuilder1.build()).execute()
-        val rawBody1 = resp1.body?.string().orEmpty()
-
-        if (!resp1.isSuccessful) {
-            throw RuntimeException("ChatGPT API request failed (HTTP ${resp1.code}): $rawBody1")
-        }
-
-        val json1 = JSONObject(rawBody1)
-        val choices1 = json1.getJSONArray("choices")
-        val firstMessage = choices1.getJSONObject(0).getJSONObject("message")
-
-        val toolCalls = firstMessage.optJSONArray("tool_calls")
-        if (toolCalls != null && toolCalls.length() > 0) {
-            val startTime = System.currentTimeMillis()
-            val firstToolCall = toolCalls.getJSONObject(0)
-            val toolCallId = firstToolCall.getString("id")
-            val funcObj = firstToolCall.getJSONObject("function")
-            val toolName = funcObj.getString("name")
-            val argsJson = JSONObject(funcObj.optString("arguments", "{}"))
-
-            val queryStr = argsJson.optString("query", userPrompt)
-            val minKappa = argsJson.optDouble("min_kappa", 0.0).toFloat()
-
-            // Local Execution against Trinity RAG Server (0ms disk wait in RAM)
-            val hits = ragServer.query(queryStr, k = 5, minKappa = minKappa)
-            val latency = System.currentTimeMillis() - startTime
-
-            val toolEvent = ToolCallEvent(
-                toolName = toolName,
-                arguments = mapOf("query" to queryStr, "min_kappa" to minKappa),
-                executionLatencyMs = latency,
-                chunksReturnedCount = hits.size,
-                averageKappa = if (hits.isNotEmpty()) hits.map { it.chunk.kappa }.average().toFloat() else 0.0f,
-                tessaStatuses = hits.map { it.chunk.tessaName }.distinct(),
-                integrityVerified = true,
-                rawResultSnippet = hits.firstOrNull()?.chunk?.content?.take(140) ?: "No chunks found"
-            )
-            onToolCallExecuted?.invoke(toolEvent)
-
-            // Step 2: Send Tool Results back to ChatGPT
-            val toolResultJson = JSONObject().apply {
-                put("query", queryStr)
-                put("results_count", hits.size)
-                val chunkArray = JSONArray()
-                for (h in hits) {
-                    val c = h.chunk
-                    chunkArray.put(JSONObject().apply {
-                        put("chunk_id", c.chunkId)
-                        put("content", c.content)
-                        put("kappa", c.kappa)
-                        put("tessa", c.tessaName)
-                        put("source", c.source)
-                        put("tier", c.tier.value)
-                        put("similarity", h.similarityScore)
-                    })
-                }
-                put("chunks", chunkArray)
-            }
-
-            messagesArray.put(firstMessage) // Assistant message with tool_calls
-            messagesArray.put(JSONObject().apply {
-                put("role", "tool")
-                put("tool_call_id", toolCallId)
-                put("content", toolResultJson.toString())
-            })
-
-            val requestBody2 = JSONObject().apply {
-                put("model", model.id)
-                put("messages", messagesArray)
-            }
-
-            val reqBuilder2 = Request.Builder()
-                .url(endpoint)
-                .addHeader("Authorization", "Bearer $token")
-                .post(requestBody2.toString().toRequestBody("application/json".toMediaType()))
-
-            if (!accountId.isNullOrBlank()) {
-                reqBuilder2.addHeader("ChatGPT-Account-ID", accountId)
-            }
-
-            val resp2 = httpClient.newCall(reqBuilder2.build()).execute()
-            val rawBody2 = resp2.body?.string().orEmpty()
-            val json2 = JSONObject(rawBody2)
-            val finalContent = json2.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
-
-            return HybridChatMessage(
-                role = "assistant",
-                content = finalContent,
-                modelId = model.id,
-                toolCall = toolEvent,
-                isGrounded = true
-            )
-        } else {
-            val directAnswer = firstMessage.optString("content", "No content returned.")
-            return HybridChatMessage(
-                role = "assistant",
-                content = directAnswer,
-                modelId = model.id,
-                toolCall = null,
-                isGrounded = false
-            )
         }
     }
 
-    private fun executeEmulatedHybridQuery(
-        userPrompt: String,
-        model: ChatGptModel,
-        onToolCallExecuted: ((ToolCallEvent) -> Unit)?
-    ): HybridChatMessage {
-        val startTime = System.currentTimeMillis()
-
-        val hits = ragServer.query(userPrompt, k = 4, minKappa = 0.50f)
-        val latency = System.currentTimeMillis() - startTime + 80
-
-        val toolEvent = ToolCallEvent(
-            toolName = "trinity_query",
-            arguments = mapOf("query" to userPrompt, "min_kappa" to 0.50f),
-            executionLatencyMs = latency,
-            chunksReturnedCount = hits.size,
-            averageKappa = if (hits.isNotEmpty()) hits.map { it.chunk.kappa }.average().toFloat() else 0.0f,
-            tessaStatuses = hits.map { it.chunk.tessaName }.distinct(),
-            integrityVerified = true,
-            rawResultSnippet = hits.firstOrNull()?.chunk?.content?.take(120) ?: "Swarm search yielded empty"
-        )
-        onToolCallExecuted?.invoke(toolEvent)
-
-        val sb = StringBuilder()
-        sb.appendLine("Synthesized response via ${model.name} (ChatGPT Hybrid Bridge):")
-        sb.appendLine()
-
-        if (hits.isEmpty()) {
-            sb.appendLine("The local P2P swarm and in-memory FAISS matrix returned 0 verified knowledge chunks matching your query.")
-            sb.appendLine("Per the strict **Forced Tool Use** directive, ChatGPT will not fabricate details regarding private swarm memory.")
-        } else {
-            val highKappaHits = hits.filter { it.chunk.kappa >= 0.85f }
-            val mediumKappaHits = hits.filter { it.chunk.kappa in 0.70f..0.85f }
-            val lowKappaHits = hits.filter { it.chunk.kappa < 0.70f }
-
-            sb.appendLine("Based on **${hits.size} retrieved knowledge chunks** verified via 256 KB SHA-256 pieces over the private network:")
-            sb.appendLine()
-
-            if (highKappaHits.isNotEmpty()) {
-                sb.appendLine("### Sovereign Truth (High Kappa κ ≥ 0.85, TESSA: BENEFIT_ACCEL_EFF)")
-                for (h in highKappaHits) {
-                    sb.appendLine("• **[Chunk ${h.chunk.chunkId.take(8)} — κ: ${"%.3f".format(h.chunk.kappa)}]**: ${h.chunk.content.trim()}")
-                }
-                sb.appendLine()
-            }
-
-            if (mediumKappaHits.isNotEmpty()) {
-                sb.appendLine("### Verified Consensus (Medium Kappa 0.70 ≤ κ < 0.85)")
-                for (h in mediumKappaHits) {
-                    sb.appendLine("• **[Chunk ${h.chunk.chunkId.take(8)} — κ: ${"%.3f".format(h.chunk.kappa)}]**: ${h.chunk.content.trim()}")
-                }
-                sb.appendLine()
-            }
-
-            if (lowKappaHits.isNotEmpty()) {
-                sb.appendLine("### Transitory Observations (κ < 0.70 — Caveat Applied)")
-                for (h in lowKappaHits) {
-                    sb.appendLine("• *[Discounted / Low Stability]*: ${h.chunk.content.take(90)}... (κ: ${"%.2f".format(h.chunk.kappa)})")
-                }
-                sb.appendLine()
-            }
-
-            sb.appendLine("**ChatGPT Hybrid Architectural Verification**:")
-            sb.appendLine("✓ Data Sovereignty: Data remained on local device & private P2P torrent cache.")
-            sb.appendLine("✓ Cloud Role: Central cognitive reasoner (on-demand lazy retrieval via ChatGPT OAuth).")
-            sb.appendLine("✓ Integrity: Verified SHA-256 blocks assembled without disk write bottlenecks.")
-        }
-
-        return HybridChatMessage(
-            role = "assistant",
-            content = sb.toString().trim(),
-            modelId = model.id,
-            toolCall = toolEvent,
-            isGrounded = hits.isNotEmpty()
+    private fun toolEvent(name: String, args: JSONObject, result: JSONObject, elapsed: Long): ToolCallEvent {
+        val textParts = result.optJSONArray("content") ?: JSONArray()
+        val text = (0 until textParts.length()).mapNotNull { textParts.optJSONObject(it)?.optString("text") }.joinToString("\n")
+        val structured = result.optJSONObject("structuredContent") ?: try { JSONObject(text) } catch (_: Exception) { JSONObject() }
+        val chunks = structured.optJSONArray("chunks") ?: JSONArray()
+        val scores = (0 until chunks.length()).mapNotNull { chunks.optJSONObject(it)?.optDouble("kappa")?.takeIf(Double::isFinite) }
+        return ToolCallEvent(
+            toolName = name,
+            arguments = args.keys().asSequence().associateWith { args.get(it) },
+            executionLatencyMs = elapsed,
+            chunksReturnedCount = chunks.length(),
+            averageKappa = if (scores.isEmpty()) 0f else scores.average().toFloat(),
+            tessaStatuses = (0 until chunks.length()).mapNotNull { chunks.optJSONObject(it)?.optString("tessa")?.takeIf(String::isNotBlank) }.distinct(),
+            integrityVerified = structured.optBoolean("integrity_verified", false),
+            rawResultSnippet = text.take(240),
+            isError = result.optBoolean("isError", false)
         )
     }
+}
+
+/** Consume SSE frames until the authoritative terminal event; truncated streams are errors. */
+internal suspend fun readResponseEvents(reader: BufferedReader, checkCancellation: suspend () -> Unit = {}): JSONArray {
+    val completedItems = sortedMapOf<Int, JSONObject>()
+    val data = StringBuilder()
+    while (true) {
+        checkCancellation()
+        val line = reader.readLine()
+        if (line != null && line.isNotEmpty()) {
+            if (line.startsWith("data:")) {
+                if (data.isNotEmpty()) data.append('\n')
+                data.append(line.removePrefix("data:").removePrefix(" "))
+            }
+            continue
+        }
+        if (data.isNotEmpty()) {
+            val frame = data.toString()
+            data.setLength(0)
+            if (frame == "[DONE]") throw IOException("Responses stream ended without response.completed.")
+            val event = JSONObject(frame)
+            when (event.optString("type")) {
+                "response.output_item.done" -> completedItems[event.optInt("output_index", completedItems.size)] = event.getJSONObject("item")
+                "response.failed", "response.incomplete", "error" -> {
+                    val response = event.optJSONObject("response") ?: event
+                    val detail = response.optJSONObject("error")?.optString("message")
+                        ?: response.optJSONObject("incomplete_details")?.optString("reason")
+                        ?: event.optString("message")
+                    throw IOException("${event.optString("type")}: ${detail.orEmpty().ifBlank { "Generation did not complete." }}")
+                }
+                "response.completed" -> {
+                    val response = event.getJSONObject("response")
+                    val status = response.optString("status")
+                    if (status.isNotBlank() && status != "completed") throw IOException("Responses terminal status: $status")
+                    val output = response.optJSONArray("output")
+                    return if (output != null && output.length() > 0) output else JSONArray(completedItems.values.toList())
+                }
+            }
+        }
+        if (line == null) throw IOException("Responses stream closed before response.completed.")
+    }
+}
+
+private fun providerError(code: Int, raw: String): String {
+    val detail = try {
+        val error = JSONObject(raw).optJSONObject("error")
+        error?.optString("message").orEmpty().take(600)
+    } catch (_: Exception) { "" }
+    return "Provider request failed (HTTP $code)${if (detail.isNotBlank()) ": $detail" else ""}"
 }

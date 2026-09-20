@@ -16,3 +16,10 @@
 local.properties
 .env
 debug.keystore
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+*.sqlite3*
+/deploy/.env

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trinity-gateway"
+version = "1.0.0"
+description = "Authenticated MCP gateway and Android device relay for Trinity"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp==2.2.0",
+  "uvicorn==0.35.0",
+  "websockets==15.0.1",
+  "python-multipart==0.0.22",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "httpx==0.28.1"]
+
+[project.scripts]
+trinity-gateway = "trinity_gateway.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["trinity_gateway*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

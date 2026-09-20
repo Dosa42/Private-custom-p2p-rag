@@ -1,0 +1,40 @@
+name: trinity
+services:
+  gateway:
+    build:
+      context: ../services/trinity_gateway
+    restart: unless-stopped
+    environment:
+      TRINITY_PUBLIC_URL: https://${TRINITY_DOMAIN:?Set TRINITY_DOMAIN in deploy/.env}
+      TRINITY_DATABASE: /data/trinity.sqlite3
+      TRINITY_DEVICE_TIMEOUT: "45"
+    volumes:
+      - gateway-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+  https:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      TRINITY_DOMAIN: ${TRINITY_DOMAIN:?Set TRINITY_DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      gateway:
+        condition: service_healthy
+volumes:
+  gateway-data:
+  caddy-data:
+  caddy-config:

@@ -41,6 +41,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -88,6 +94,13 @@ fun HybridCloudScreen(
     val customModelInput by viewModel.customModelInput.collectAsState()
     val isFetchingModels by viewModel.isFetchingModels.collectAsState()
     val isMcpRunning by viewModel.isMcpServerRunning.collectAsState()
+    val gatewayUrl by viewModel.gatewayUrl.collectAsState()
+    val deviceToken by viewModel.gatewayDeviceToken.collectAsState()
+    val gatewayStatus by viewModel.gatewayStatus.collectAsState()
+    val gatewayPrincipal by viewModel.gatewayPrincipal.collectAsState()
+    val connectionStatus by viewModel.connectionStatus.collectAsState()
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     val chatMessages by viewModel.hybridChatMessages.collectAsState()
     val isQuerying by viewModel.isHybridQuerying.collectAsState()
     val lastToolEvent by viewModel.lastToolCallEvent.collectAsState()
@@ -191,7 +204,7 @@ fun HybridCloudScreen(
                                             fontFamily = FontFamily.Monospace
                                         )
                                         Text(
-                                            text = "Expires in: ${session.expiresInSeconds}s • PKCE Session Active",
+                                            text = if (session.isExpired) "Session expired; refresh required" else "Expires in: ${session.expiresInSeconds}s",
                                             fontSize = 9.sp,
                                             color = TrinityGreen,
                                             fontFamily = FontFamily.Monospace
@@ -480,7 +493,6 @@ fun HybridCloudScreen(
                 }
             }
 
-            // --- MODEL CONTEXT PROTOCOL (MCP) & OPENAI ACTION SERVER ---
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -488,85 +500,39 @@ fun HybridCloudScreen(
                     colors = CardDefaults.cardColors(containerColor = TrinitySurfaceNavy),
                     border = BorderStroke(1.dp, TrinityGreen.copy(alpha = 0.35f))
                 ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.Cloud,
-                                    contentDescription = null,
-                                    tint = TrinityGreen,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "MODEL CONTEXT PROTOCOL (MCP)",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                            }
-
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(if (isMcpRunning) TrinityGreen.copy(alpha = 0.2f) else Color.Red.copy(alpha = 0.2f))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    text = if (isMcpRunning) "127.0.0.1:1456 ONLINE" else "OFFLINE",
-                                    color = if (isMcpRunning) TrinityGreen else Color.Red,
-                                    fontSize = 9.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(TrinityDeepNavy)
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = "Manifest: /.well-known/ai-plugin.json",
-                                    fontSize = 9.sp,
-                                    color = TrinityCyan,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(TrinityDeepNavy)
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = "OpenAPI: /openapi.json",
-                                    fontSize = 9.sp,
-                                    color = TrinityAccentGold,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(6.dp))
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("CONNECT YOUR TRINITY SERVER", color = TrinityGreen, fontWeight = FontWeight.Bold)
                         Text(
-                            text = "MCP JSON-RPC 2.0 endpoints: tools/list, tools/call (trinity_query, trinity_swarm_status), resources/list, resources/read.",
-                            fontSize = 9.sp,
-                            color = Color.White.copy(alpha = 0.7f),
-                            fontFamily = FontFamily.Monospace
+                            "Link this device to your HTTPS server so ChatGPT can access its RAG tools.",
+                            color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp
                         )
+                        OutlinedTextField(
+                            value = gatewayUrl, onValueChange = { viewModel.gatewayUrl.value = it },
+                            label = { Text("Server URL (https://…)") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedTextField(
+                            value = deviceToken, onValueChange = { viewModel.gatewayDeviceToken.value = it },
+                            label = { Text("Device token") }, singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = {
+                                if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                viewModel.connectGateway()
+                            }) { Text("Connect device") }
+                            TextButton(onClick = { viewModel.disconnectGateway() }) { Text("Disconnect") }
+                        }
+                        Text(gatewayStatus, color = TrinityCyan, fontSize = 12.sp)
+                        gatewayPrincipal?.let { Text("Linked account: $it", color = Color.White, fontSize = 11.sp) }
+                        connectionStatus?.let { Text(it, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp) }
+                        Text(
+                            if (isMcpRunning) "Local MCP is listening." else "Local MCP is stopped.",
+                            color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp
+                        )
+                        if (gatewayUrl.isNotBlank()) {
+                            Text("ChatGPT connector URL: ${gatewayUrl.trimEnd('/')}/mcp", color = TrinityAccentGold, fontSize = 11.sp)
+                        }
                     }
                 }
             }
@@ -599,7 +565,7 @@ fun HybridCloudScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "ChatGPT executing local 'trinity_query' on RAM FAISS matrix & P2P cache...",
+                            text = "Waiting for the provider and MCP tool results…",
                             fontSize = 11.sp,
                             color = TrinityCyan,
                             fontFamily = FontFamily.Monospace
@@ -724,7 +690,7 @@ private fun ToolCallCard(event: ToolCallEvent) {
                         .padding(horizontal = 6.dp, vertical = 2.dp)
                 ) {
                     Text(
-                        text = "${event.executionLatencyMs}ms (RAM)",
+                        text = "${event.executionLatencyMs}ms",
                         fontSize = 9.sp,
                         color = TrinityGreen,
                         fontFamily = FontFamily.Monospace,
@@ -759,7 +725,7 @@ private fun ToolCallCard(event: ToolCallEvent) {
                     fontFamily = FontFamily.Monospace
                 )
                 Text(
-                    text = "SHA-256 Verified ✓",
+                    text = if (event.isError) "Tool failed" else if (event.integrityVerified) "SHA-256 verified" else "Tool result received",
                     fontSize = 10.sp,
                     color = TrinityGreen,
                     fontFamily = FontFamily.Monospace

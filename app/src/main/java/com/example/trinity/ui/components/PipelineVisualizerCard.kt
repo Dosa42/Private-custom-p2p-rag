@@ -137,7 +137,7 @@ fun PipelineVisualizerCard(
                 stepNumber = "4",
                 fileTag = "Bestand 7: p2p_protocol.py & Kademlia DHT",
                 title = "Embedded DHT & Bootstrap Nodes",
-                subtitle = "Kademlia routing table (XOR metric) with hardcoded bootstrap nodes (Zero external tracker)",
+                subtitle = "Local XOR routing index populated by authenticated peers",
                 icon = Icons.Default.SwapHoriz,
                 accentColor = TrinityGreen,
                 isActive = lastResult != null,
@@ -150,12 +150,12 @@ fun PipelineVisualizerCard(
             PipelineNode(
                 stepNumber = "5",
                 fileTag = "Bestand 1, 4 & 6: In-Memory RAG Engine",
-                title = "Direct In-Memory FAISS Matrix",
-                subtitle = "P2P piece blocks push vector floats directly to RAM; AI queries immediately with 0ms disk wait",
+                title = "Local Vector Index",
+                subtitle = "Verified peer knowledge is persisted and added to the local query index",
                 icon = Icons.Default.Memory,
                 accentColor = TrinityCyan,
                 isActive = lastResult != null,
-                activeInfo = lastResult?.let { "In-Memory Live: Immediate FAISS search before physical disk write-behind" }
+                activeInfo = lastResult?.let { "Indexed local and verified peer knowledge" }
             )
         }
     }

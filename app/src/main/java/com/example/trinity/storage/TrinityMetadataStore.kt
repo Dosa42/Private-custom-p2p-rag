@@ -12,8 +12,11 @@ import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.db") :
-    SQLiteOpenHelper(context, dbName, null, 1) {
+class TrinityMetadataStore(
+    context: Context,
+    dbName: String = "trinity_metadata.db",
+    private val legacyOwnerId: String = "default_user"
+) : SQLiteOpenHelper(context, dbName, null, 2) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -26,6 +29,7 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
                 confidence TEXT DEFAULT 'medium',
                 source TEXT DEFAULT 'hub',
                 session_id TEXT DEFAULT '',
+                owner_id TEXT NOT NULL,
                 kappa REAL DEFAULT 0.5,
                 tessa_name TEXT DEFAULT 'BENEFIT_STABLE',
                 access_count INTEGER DEFAULT 0,
@@ -41,6 +45,7 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 query_text TEXT,
                 results TEXT,
+                owner_id TEXT NOT NULL,
                 ts REAL
             )
             """.trimIndent()
@@ -48,47 +53,53 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS chunks")
-        db.execSQL("DROP TABLE IF EXISTS query_log")
-        onCreate(db)
-    }
-
-    fun storeChunk(chunk: KnowledgeChunk): Boolean {
-        return try {
-            val db = writableDatabase
-            val values = ContentValues().apply {
-                put("chunk_id", chunk.chunkId)
-                put("content", chunk.content)
-                put("vector_blob", chunk.vector?.let { serializeVector(it.data) })
-                put("tier", chunk.tier.value)
-                put("confidence", chunk.confidence.name.lowercase())
-                put("source", chunk.source)
-                put("session_id", chunk.sessionId)
-                put("kappa", chunk.kappa)
-                put("tessa_name", chunk.tessaName)
-                put("access_count", chunk.accessCount)
-                put("last_accessed", chunk.lastAccessed.toDouble())
-                put("created_at", chunk.createdAt.toDouble())
-                put("metadata_json", JSONObject(chunk.metadata as Map<*, *>).toString())
-            }
-            db.insertWithOnConflict("chunks", null, values, SQLiteDatabase.CONFLICT_REPLACE) > 0
-        } catch (_: Exception) {
-            false
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE chunks ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            db.execSQL("UPDATE chunks SET owner_id = ? WHERE owner_id = ''", arrayOf(legacyOwnerId))
+            db.execSQL("ALTER TABLE query_log ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            db.execSQL("UPDATE query_log SET owner_id = ? WHERE owner_id = ''", arrayOf(legacyOwnerId))
         }
     }
 
-    fun getChunk(chunkId: String): KnowledgeChunk? {
+    @Synchronized
+    fun storeChunk(chunk: KnowledgeChunk): Boolean {
+        require(chunk.ownerId.isNotBlank()) { "Chunk owner is required" }
+        val previous = getChunk(chunk.chunkId)
+        require(previous == null || previous.ownerId == chunk.ownerId) { "Chunk belongs to another owner" }
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("chunk_id", chunk.chunkId)
+            put("content", chunk.content)
+            put("vector_blob", chunk.vector?.let { serializeVector(it.data) })
+            put("tier", chunk.tier.value)
+            put("confidence", chunk.confidence.name.lowercase())
+            put("source", chunk.source)
+            put("session_id", chunk.sessionId)
+            put("owner_id", chunk.ownerId)
+            put("kappa", chunk.kappa)
+            put("tessa_name", chunk.tessaName)
+            put("access_count", chunk.accessCount)
+            put("last_accessed", chunk.lastAccessed.toDouble())
+            put("created_at", chunk.createdAt.toDouble())
+            put("metadata_json", JSONObject(chunk.metadata as Map<*, *>).toString())
+        }
+        return db.insertWithOnConflict("chunks", null, values, SQLiteDatabase.CONFLICT_REPLACE) > 0
+    }
+
+    fun getChunk(chunkId: String, ownerId: String? = null): KnowledgeChunk? {
         val db = readableDatabase
-        val cursor = db.rawQuery("SELECT * FROM chunks WHERE chunk_id = ?", arrayOf(chunkId))
+        val cursor = if (ownerId == null) db.rawQuery("SELECT * FROM chunks WHERE chunk_id = ?", arrayOf(chunkId))
+        else db.rawQuery("SELECT * FROM chunks WHERE chunk_id = ? AND owner_id = ?", arrayOf(chunkId, ownerId))
         return cursor.use {
             if (it.moveToFirst()) rowToChunk(it) else null
         }
     }
 
-    fun getAllChunks(limit: Int = 200): List<KnowledgeChunk> {
+    fun getAllChunks(limit: Int = Int.MAX_VALUE, ownerId: String? = null): List<KnowledgeChunk> {
         val list = mutableListOf<KnowledgeChunk>()
         val db = readableDatabase
-        val cursor = db.rawQuery("SELECT * FROM chunks ORDER BY created_at DESC LIMIT ?", arrayOf(limit.toString()))
+        val cursor = if (ownerId == null) db.rawQuery("SELECT * FROM chunks ORDER BY created_at DESC LIMIT ?", arrayOf(limit.toString()))
+        else db.rawQuery("SELECT * FROM chunks WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?", arrayOf(ownerId, limit.toString()))
         cursor.use {
             while (it.moveToNext()) {
                 list.add(rowToChunk(it))
@@ -96,6 +107,27 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
         }
         return list
     }
+
+    @Synchronized
+    fun adoptOwner(fromOwnerId: String, toOwnerId: String) {
+        require(fromOwnerId.isNotBlank() && toOwnerId.isNotBlank())
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (chunk in getAllChunks(ownerId = fromOwnerId)) {
+                val values = ContentValues().apply {
+                    put("owner_id", toOwnerId)
+                    put("metadata_json", JSONObject(chunk.metadata + ("owner_id" to toOwnerId)).toString())
+                }
+                db.update("chunks", values, "chunk_id = ? AND owner_id = ?", arrayOf(chunk.chunkId, fromOwnerId))
+            }
+            db.execSQL("UPDATE query_log SET owner_id = ? WHERE owner_id = ?", arrayOf(toOwnerId, fromOwnerId))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun removeChunk(chunkId: String, ownerId: String): Boolean =
+        writableDatabase.delete("chunks", "chunk_id = ? AND owner_id = ?", arrayOf(chunkId, ownerId)) > 0
 
     fun getChunksByTier(tier: StorageTier, limit: Int = 100): List<KnowledgeChunk> {
         val list = mutableListOf<KnowledgeChunk>()
@@ -125,30 +157,33 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
         db.execSQL("UPDATE chunks SET tier = ? WHERE chunk_id = ?", arrayOf(newTier.value, chunkId))
     }
 
-    fun logQuery(query: String, resultsJson: String) {
+    fun logQuery(query: String, resultsJson: String, ownerId: String = legacyOwnerId) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put("query_text", query)
             put("results", resultsJson)
+            put("owner_id", ownerId)
             put("ts", System.currentTimeMillis().toDouble())
         }
         db.insert("query_log", null, values)
     }
 
-    fun getStats(): Map<String, Any> {
+    fun getStats(ownerId: String? = null): Map<String, Any> {
         val db = readableDatabase
         var total = 0
         var avgKappa = 0.5
         val byTier = mutableMapOf<String, Int>()
 
-        db.rawQuery("SELECT COUNT(*), AVG(kappa) FROM chunks", null).use {
+        val where = if (ownerId == null) "" else " WHERE owner_id = ?"
+        val arguments = ownerId?.let { arrayOf(it) }
+        db.rawQuery("SELECT COUNT(*), AVG(kappa) FROM chunks$where", arguments).use {
             if (it.moveToFirst()) {
                 total = it.getInt(0)
                 avgKappa = if (!it.isNull(1)) it.getDouble(1) else 0.5
             }
         }
 
-        db.rawQuery("SELECT tier, COUNT(*) FROM chunks GROUP BY tier", null).use {
+        db.rawQuery("SELECT tier, COUNT(*) FROM chunks$where GROUP BY tier", arguments).use {
             while (it.moveToNext()) {
                 byTier[it.getString(0)] = it.getInt(1)
             }
@@ -217,7 +252,8 @@ class TrinityMetadataStore(context: Context, dbName: String = "trinity_metadata.
             accessCount = accessCount,
             lastAccessed = lastAccessed,
             createdAt = createdAt,
-            metadata = metaMap
+            metadata = metaMap,
+            ownerId = cursor.getString(cursor.getColumnIndexOrThrow("owner_id"))
         )
     }
 }

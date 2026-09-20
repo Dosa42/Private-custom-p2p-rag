@@ -1,0 +1,7 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$TRINITY_DOMAIN} {
+    reverse_proxy gateway:8000
+}

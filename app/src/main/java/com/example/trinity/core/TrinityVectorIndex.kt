@@ -12,6 +12,7 @@ class TrinityVectorIndex(val dimension: Int = 384) {
 
     @Synchronized
     fun add(chunkId: String, vector: FloatArray): Int {
+        require(vector.size == dimension && vector.all { it.isFinite() }) { "Invalid indexed vector" }
         vectors[chunkId] = vector
         if (!idMap.contains(chunkId)) {
             idMap.add(chunkId)
@@ -20,7 +21,9 @@ class TrinityVectorIndex(val dimension: Int = 384) {
     }
 
     @Synchronized
-    fun search(queryVector: FloatArray, k: Int = 10): List<Pair<String, Float>> {
+    fun search(queryVector: FloatArray, k: Int = 10, allowedIds: Set<String>? = null): List<Pair<String, Float>> {
+        require(k >= 0) { "Result count must not be negative" }
+        require(queryVector.size == dimension) { "Query vector dimension mismatch" }
         if (idMap.isEmpty() || vectors.isEmpty()) return emptyList()
 
         var qNormSum = 0.0
@@ -29,6 +32,7 @@ class TrinityVectorIndex(val dimension: Int = 384) {
 
         val scored = mutableListOf<Pair<String, Float>>()
         for ((chunkId, vec) in vectors) {
+            if (allowedIds != null && chunkId !in allowedIds) continue
             var dot = 0.0
             var vNormSum = 0.0
             for (i in 0 until dimension.coerceAtMost(vec.size)) {

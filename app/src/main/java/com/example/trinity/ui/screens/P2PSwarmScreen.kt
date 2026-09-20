@@ -48,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -71,10 +72,14 @@ fun P2PSwarmScreen(
     val peers by viewModel.connectedPeers.collectAsState()
     val logs by viewModel.swarmLogs.collectAsState()
     val currentRole by viewModel.currentNodeRole.collectAsState()
+    val swarmKey by viewModel.swarmKey.collectAsState()
+    val connectionStatus by viewModel.connectionStatus.collectAsState()
+    val peerListening by viewModel.ragServer.peerManager.listening.collectAsState()
+
 
     var showAddDialog by remember { mutableStateOf(false) }
     var peerName by remember { mutableStateOf("") }
-    var peerAddress by remember { mutableStateOf("192.168.1.150") }
+    var peerAddress by remember { mutableStateOf("") }
     var peerPort by remember { mutableStateOf("6881") }
 
     val trackerStats = viewModel.ragServer.trackerServer.getStats()
@@ -85,6 +90,20 @@ fun P2PSwarmScreen(
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = TrinitySurfaceNavy)) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("PRIVATE PEER CONNECTION", color = TrinityCyan, fontWeight = FontWeight.Bold)
+                    Text("Use the same shared key and linked Trinity account on your devices.", color = Color.White, fontSize = 12.sp)
+                    OutlinedTextField(value = swarmKey, onValueChange = { viewModel.swarmKey.value = it },
+                        label = { Text("Shared swarm key") }, visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(), singleLine = true)
+                    Button(onClick = { viewModel.configurePeerNetwork() }) { Text("Start peer connection") }
+                    Text(if (peerListening) "Peer listener active on port ${viewModel.ragServer.peerManager.boundPort}" else "Peer listener stopped", color = TrinityCyan, fontSize = 11.sp)
+                    connectionStatus?.let { Text(it, color = Color.White, fontSize = 11.sp) }
+                }
+            }
+        }
         item {
             Spacer(modifier = Modifier.height(4.dp))
             // Node Identity & Tracker Card
@@ -340,7 +359,7 @@ fun P2PSwarmScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "160-bit XOR Metric • Auto-discovers private mesh network without central HTTP website.",
+                        text = "Local XOR routing index. Add a peer address to establish a network connection.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.White.copy(alpha = 0.7f),
                         fontSize = 11.sp
@@ -357,7 +376,7 @@ fun P2PSwarmScreen(
 
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "Hardcoded Bootstrap Nodes (${dht.bootstrapNodes.size}):",
+                        text = "Configured Bootstrap Nodes (${dht.bootstrapNodes.size}):",
                         style = MaterialTheme.typography.labelSmall,
                         color = TrinityAccentGold,
                         fontFamily = FontFamily.Monospace,
@@ -386,7 +405,7 @@ fun P2PSwarmScreen(
                                         .background(TrinityGreen.copy(alpha = 0.15f))
                                         .padding(horizontal = 6.dp, vertical = 2.dp)
                                 ) {
-                                    Text("BOOTSTRAPPED", fontSize = 9.sp, color = TrinityGreen, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                    Text("CONFIGURED", fontSize = 9.sp, color = TrinityGreen, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
@@ -451,7 +470,7 @@ fun P2PSwarmScreen(
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = "0ms DISK WAIT",
+                                text = "LOCAL VECTOR INDEX",
                                 color = TrinityCyan,
                                 fontSize = 9.sp,
                                 fontFamily = FontFamily.Monospace,
@@ -462,7 +481,7 @@ fun P2PSwarmScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Incoming torrent blocks push vector floats directly into the active FAISS search matrix in RAM. The AI searches newly arrived knowledge before disk write-behind commits.",
+                        text = "Verified peer blocks update the local vector index and stored knowledge.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.White.copy(alpha = 0.7f),
                         fontSize = 11.sp,
@@ -494,7 +513,7 @@ fun P2PSwarmScreen(
                                 .padding(8.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Text("Active FAISS Vectors", fontSize = 9.sp, color = Color.White.copy(alpha = 0.5f), fontFamily = FontFamily.Monospace)
+                            Text("Local indexed vectors", fontSize = 9.sp, color = Color.White.copy(alpha = 0.5f), fontFamily = FontFamily.Monospace)
                             Text("$totalVectors", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TrinityElectricBlue)
                         }
 
