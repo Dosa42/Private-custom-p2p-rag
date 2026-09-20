@@ -102,25 +102,23 @@ jobs:
             else
               touch .env
             fi
-            # Inject CI fallback placeholder if not set
-            if ! grep -q "GEMINI_API_KEY" .env; then
-              echo "GEMINI_API_KEY=ci_build_dummy_placeholder_key" >> .env
-            fi
           fi
           echo "✓ .env configuration validated"
 
-          # Fix 3: Restore or Generate Debug Keystore (Prevent signing failure)
-          mkdir -p ~/.android
-          if [ -f "debug.keystore.base64" ] && [ ! -f "~/.android/debug.keystore" ]; then
-            echo "✓ Decoding debug.keystore.base64..."
-            base64 -d debug.keystore.base64 > ~/.android/debug.keystore || true
+          # Fix 3: Use the same debug keystore path as app/build.gradle.kts
+          DEBUG_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
+          if [ ! -f "$DEBUG_KEYSTORE" ] && [ -f "debug.keystore.base64" ]; then
+            echo "Decoding debug.keystore.base64..."
+            base64 -d debug.keystore.base64 > "$DEBUG_KEYSTORE"
           fi
-          if [ ! -f "~/.android/debug.keystore" ] && [ ! -f "debug.keystore" ]; then
-            echo "✓ Generating self-signed debug keystore for CI..."
-            keytool -genkey -v -keystore ~/.android/debug.keystore -alias androiddebugkey \
+          if [ ! -f "$DEBUG_KEYSTORE" ]; then
+            echo "Generating debug keystore for CI..."
+            keytool -genkeypair -v -keystore "$DEBUG_KEYSTORE" -alias androiddebugkey \
               -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US" || true
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
+          keytool -list -keystore "$DEBUG_KEYSTORE" -storepass android -alias androiddebugkey > /dev/null
+          echo "Debug keystore ready at the Gradle signing path"
 
           # Fix 4: Memory and CI performance tuning in gradle.properties
           cat << 'EOF' >> gradle.properties
@@ -136,6 +134,7 @@ jobs:
       # 5. Dynamic Self-Fixing Build Execution (Anti-Error-Loop System)
       - name: Build Debug APK with Dynamic Self-Healing Engine
         id: build_step
+        shell: bash
         run: |
           echo "=== INITIATING ATTEMPT 1: Primary Debug APK Build ==="
           BUILD_SUCCESS=false

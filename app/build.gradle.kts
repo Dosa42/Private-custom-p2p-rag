@@ -1,3 +1,4 @@
+import com.android.build.api.variant.BuildConfigField
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
 plugins {
@@ -69,6 +70,19 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+}
+
+// Secrets Plugin 2.0.1 emits an empty Java expression for an empty property.
+androidComponents {
+  onVariants { variant ->
+    val field = variant.buildConfigFields.get()["GEMINI_API_KEY"]
+    if (field?.type == "String" && field.value == "") {
+      variant.buildConfigFields.put(
+        "GEMINI_API_KEY",
+        BuildConfigField("String", "\"\"", field.comment)
+      )
+    }
+  }
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
