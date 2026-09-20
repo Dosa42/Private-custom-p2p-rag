@@ -1,0 +1,267 @@
+name: Build Debug APK (Self-Healing CI)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+      - develop
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      clean_cache:
+        description: 'Force clean cache before building'
+        required: false
+        type: boolean
+        default: false
+      verbose_logging:
+        description: 'Enable verbose Gradle stacktrace'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug-apk:
+    name: Build & Self-Heal Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 1. Minimum Java 21 Toolchain
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      # 2. Android SDK & NDK Setup
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK & CMake
+        run: |
+          echo "=== Installing Android NDK & CMake ==="
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.0.12077973" "cmake;3.22.1"
+          
+          NDK_PATH="${ANDROID_HOME}/ndk/27.0.12077973"
+          if [ -d "$NDK_PATH" ]; then
+            echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+            echo "ANDROID_NDK_ROOT=$NDK_PATH" >> $GITHUB_ENV
+            echo "✓ Android NDK 27 installed at: $NDK_PATH"
+          else
+            echo "::warning::Specific NDK version not found, locating fallback..."
+            FALLBACK_NDK=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 | head -n 1)
+            if [ -n "$FALLBACK_NDK" ]; then
+              echo "ANDROID_NDK_HOME=$FALLBACK_NDK" >> $GITHUB_ENV
+              echo "ANDROID_NDK_ROOT=$FALLBACK_NDK" >> $GITHUB_ENV
+              echo "✓ Fallback NDK located at: $FALLBACK_NDK"
+            fi
+          fi
+
+      # 3. Gradle 9.1+ Setup
+      - name: Setup Gradle 9.3+
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: false
+
+      # 4. Pre-Flight Auto-Healing & Environment Sanitization
+      - name: Pre-Flight Self-Healing & Environment Preparation
+        run: |
+          echo "=== Starting Pre-Flight Self-Healing Engine ==="
+          
+          # Fix 1: Ensure gradlew exists and has executable permissions
+          if [ ! -f "./gradlew" ]; then
+            echo "::warning::gradlew wrapper missing, bootstrapping Gradle 9.3.1 wrapper..."
+            gradle wrapper --gradle-version 9.3.1
+          fi
+          chmod +x ./gradlew
+          echo "✓ gradlew executable permissions verified"
+
+          # Fix 2: Prevent Secrets Gradle Plugin crash by ensuring .env exists
+          if [ ! -f ".env" ]; then
+            echo "✓ Generating .env file from .env.example..."
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+            else
+              touch .env
+            fi
+            # Inject CI fallback placeholder if not set
+            if ! grep -q "GEMINI_API_KEY" .env; then
+              echo "GEMINI_API_KEY=ci_build_dummy_placeholder_key" >> .env
+            fi
+          fi
+          echo "✓ .env configuration validated"
+
+          # Fix 3: Restore or Generate Debug Keystore (Prevent signing failure)
+          mkdir -p ~/.android
+          if [ -f "debug.keystore.base64" ] && [ ! -f "~/.android/debug.keystore" ]; then
+            echo "✓ Decoding debug.keystore.base64..."
+            base64 -d debug.keystore.base64 > ~/.android/debug.keystore || true
+          fi
+          if [ ! -f "~/.android/debug.keystore" ] && [ ! -f "debug.keystore" ]; then
+            echo "✓ Generating self-signed debug keystore for CI..."
+            keytool -genkey -v -keystore ~/.android/debug.keystore -alias androiddebugkey \
+              -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" || true
+          fi
+
+          # Fix 4: Memory and CI performance tuning in gradle.properties
+          cat << 'EOF' >> gradle.properties
+
+          # CI Self-Healing Memory & Concurrency Optimization
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.workers.max=2
+          kotlin.compiler.execution.strategy=in-process
+          EOF
+          echo "✓ gradle.properties patched with CI-safe JVM constraints"
+
+      # 5. Dynamic Self-Fixing Build Execution (Anti-Error-Loop System)
+      - name: Build Debug APK with Dynamic Self-Healing Engine
+        id: build_step
+        run: |
+          echo "=== INITIATING ATTEMPT 1: Primary Debug APK Build ==="
+          BUILD_SUCCESS=false
+          
+          # Run Attempt 1
+          if ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee build_attempt1.log; then
+            BUILD_SUCCESS=true
+            echo "✓ Attempt 1 Succeeded: Debug APK generated successfully."
+          else
+            echo "::warning::Attempt 1 failed. Activating Dynamic Self-Healing Diagnostic Engine..."
+            
+            # --- DYNAMIC DIAGNOSTIC ANALYZER ---
+            echo "=== ANALYZING LOGS FOR KNOWN FAILURE PATTERNS ==="
+            RETRY_FLAGS=""
+            
+            # Diagnostic 1: Out of Memory / GC Overhead
+            if grep -Eiq "(OutOfMemoryError|GC overhead limit exceeded|Metaspace)" build_attempt1.log; then
+              echo "::warning::[HEAL-ACTION]: Detected Out Of Memory condition. Bumping JVM heap to 6GB..."
+              sed -i 's/-Xmx[0-9]*[a-zA-Z]*/-Xmx6144m/g' gradle.properties
+              RETRY_FLAGS="$RETRY_FLAGS --no-daemon"
+            fi
+
+            # Diagnostic 2: Configuration Cache / Daemon Incompatibility
+            if grep -Eiq "(Configuration cache|DaemonDisappearedException|Could not connect to Kotlin compile daemon)" build_attempt1.log; then
+              echo "::warning::[HEAL-ACTION]: Detected Daemon/Configuration-Cache issue. Disabling configuration cache & stopping daemons..."
+              ./gradlew --stop || true
+              rm -rf .gradle/configuration-cache || true
+              RETRY_FLAGS="$RETRY_FLAGS --no-configuration-cache --no-daemon"
+            fi
+
+            # Diagnostic 3: Corrupt KSP or Incremental Build Artifacts
+            if grep -Eiq "(ksp|incremental|A failure occurred while executing org.jetbrains.kotlin)" build_attempt1.log; then
+              echo "::warning::[HEAL-ACTION]: Detected compiler/KSP task collision. Triggering targeted clean and rerun..."
+              ./gradlew :app:clean --no-daemon || true
+              RETRY_FLAGS="$RETRY_FLAGS --rerun-tasks"
+            fi
+
+            # Diagnostic 4: Missing or Unaccepted SDK licenses
+            if grep -Eiq "(licenses have not been accepted|sdkmanager)" build_attempt1.log; then
+              echo "::warning::[HEAL-ACTION]: Refreshing Android SDK licenses..."
+              yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
+            fi
+
+            echo "=== INITIATING ATTEMPT 2: Executing Healed Build with flags: $RETRY_FLAGS ==="
+            if ./gradlew :app:assembleDebug $RETRY_FLAGS --stacktrace 2>&1 | tee build_attempt2.log; then
+              BUILD_SUCCESS=true
+              echo "✓ Attempt 2 Succeeded! Self-healing engine successfully recovered the build."
+            else
+              echo "::error::Attempt 2 also failed. Generating comprehensive diagnostic summary..."
+              cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ## ❌ Build Failure Diagnostic Report
+          The self-healing build engine attempted remediation but encountered fatal errors.
+          
+          ### Key Failure Snippets:
+          ```text
+          EOF
+              grep -E -C 3 -i "(error:|FAILED|Exception:)" build_attempt2.log | tail -n 40 >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          fi
+
+      # 6. Locate, Validate & Generate APK Summary
+      - name: Validate & Report Generated Debug APK
+        if: success()
+        run: |
+          echo "=== Locating Built APKs ==="
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" -type f | head -n 1)
+          
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "::warning::APK not found in default path, searching entire workspace..."
+            APK_PATH=$(find . -name "*.apk" -type f | grep -v "androidTest" | head -n 1)
+          fi
+
+          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            FILE_SIZE=$(du -h "$APK_PATH" | cut -f1)
+            SHA256_SUM=$(sha256sum "$APK_PATH" | cut -d ' ' -f 1)
+            
+            echo "FOUND_APK_PATH=$APK_PATH" >> $GITHUB_ENV
+            echo "APK_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+            echo "APK_SHA256=$SHA256_SUM" >> $GITHUB_ENV
+            
+            echo "✓ Found Debug APK: $APK_PATH"
+            echo "✓ Size: $FILE_SIZE"
+            echo "✓ SHA256: $SHA256_SUM"
+
+            # Populate GitHub Actions Step Summary
+            cat << EOF >> $GITHUB_STEP_SUMMARY
+          # 🚀 Debug APK Build Succeeded!
+          
+          | Metric | Value |
+          |---|---|
+          | **Artifact Path** | \`$APK_PATH\` |
+          | **Size** | **$FILE_SIZE** |
+          | **SHA-256 Checksum** | \`$SHA256_SUM\` |
+          | **Java Version** | **OpenJDK 21 (Temurin)** |
+          | **Gradle Version** | **9.3.1** |
+          | **Android NDK** | **27.0.12077973 (CMake 3.22)** |
+          | **Self-Healing Status** | **Clean / Remediated** |
+          
+          The debug APK is ready for testing and can be downloaded from the **Artifacts** section below.
+          EOF
+          else
+            echo "::error::No APK found after build step completed!"
+            exit 1
+          fi
+
+      # 7. Upload Artifact (Debug APK)
+      - name: Upload Debug APK Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trinity-core-debug-apk
+          path: ${{ env.FOUND_APK_PATH }}
+          retention-days: 30
+          if-no-files-found: error
+
+      # 8. Diagnostics Upload (If Build Fails)
+      - name: Upload Build Failure Logs (Diagnostics)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-diagnostics
+          path: |
+            build_attempt1.log
+            build_attempt2.log
+            app/build/reports/
+          retention-days: 7
+          if-no-files-found: ignore

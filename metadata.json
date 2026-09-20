@@ -1,0 +1,7 @@
+{
+  "name": "Trinity Core",
+  "description": "SDCK-RAG memory engine, P2P torrent swarm synchronization, and tiered storage manager ported for Android",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Trinity Core</string>
+    <string name="tab_rag">RAG Engine</string>
+    <string name="tab_p2p">P2P Swarm</string>
+    <string name="tab_storage">Storage</string>
+    <string name="tab_ask">Direct Query</string>
+</resources>
+
