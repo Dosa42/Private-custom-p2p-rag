@@ -214,7 +214,7 @@ jobs:
             fi
             "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK_PATH" | tee apk-signature.log
             EXPECTED_CERT_SHA256=$(keytool -exportcert -keystore "$GITHUB_WORKSPACE/debug.keystore" -storepass android -alias androiddebugkey | sha256sum | cut -d ' ' -f 1)
-            APK_CERT_SHA256=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' apk-signature.log)
+            APK_CERT_SHA256=$(sed -n 's/^.*certificate SHA-256 digest: //p' apk-signature.log | sort -u)
             if [ "$APK_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
               echo "::error::APK signer does not match the fixed Trinity debug certificate"
               exit 1
